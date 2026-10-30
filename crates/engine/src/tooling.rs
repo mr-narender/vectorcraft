@@ -106,7 +106,15 @@ impl Session {
         {
             crate::cmd::distortcmds::silent(self, |g| g.visible = true)?;
         }
-        self.switch_tool(id, view)
+        // When the tool already active, or the tool lent a selection tool for a drag, is chosen again,
+        // `select_tool` calls its [`Tool::chosen_again`] (the Blend tool finishes its blend).
+        let again = self.lender.as_ref().unwrap_or(&self.tool).id() == id;
+        self.switch_tool(id, view)?;
+        if again {
+            let acts = self.with_tool_cx(view, |t, cx| t.chosen_again(cx));
+            self.apply_actions(acts)?;
+        }
+        Ok(())
     }
 
     /// Switch to tool `id` without choosing it afresh (back from a temporary tool: a hidden
@@ -263,6 +271,7 @@ impl Session {
             snap_tangent: self.prefs.snap_tangent,
             snap_perpendicular: self.prefs.snap_perpendicular,
             snap_to_glyph: view.snap_to_glyph && view.smart_guides && !view.snap_to_grid,
+            glyph_snap: self.prefs.glyph_snap,
             corner_widgets: view.corner_widgets,
             fill_active: self.fill_active,
             gradient_stop: self.selected_stop(),
@@ -695,6 +704,19 @@ impl Session {
         }
     }
 
+    /// End the Type tool's text editing before a command saves the art of an editing layer (pattern
+    /// editing's Done, Stop Editing Opacity Mask): point type its click placed that is still empty is
+    /// discarded first, so it is not saved into the pattern tile or the mask.
+    pub(crate) fn end_text_edit(&mut self) {
+        if self.in_tool_actions || !self.tool.wants_text() {
+            return;
+        }
+        let acts = self.with_tool_cx(self.last_view, |t, cx| t.deactivate(cx));
+        if let Err(e) = self.apply_actions(acts) {
+            log::warn!("ending the text edit: {e}");
+        }
+    }
+
     /// Tell the active tool that `edit.undo` or `edit.redo` ran, on its own or as a step of
     /// `command.batch`, so the Type tool puts the caret where the step changed the text; or that a
     /// `command.batch` began, ended or was rolled back (`batch.begin`, `batch.end`,
@@ -721,8 +743,9 @@ impl Session {
                 Action::Begin(label) => self.begin_interaction(&label)?,
                 Action::Preview(cmd, p) => {
                     // Performance › Real-time Drawing and Editing (#394): off, remember the latest
-                    // params and apply them once on Commit instead of every move.
-                    if !self.prefs.real_time_drawing {
+                    // params and apply them once on Commit instead of every move. A ruler guide
+                    // being dragged still shows: the guide is all there is to see (#4646).
+                    if !self.prefs.real_time_drawing && !matches!(cmd.as_str(), "guide.add" | "guide.move") {
                         self.clear_deferred_overlay_cache();
                         let st = self.doc_mut()?;
                         if let Some(it) = &mut st.interaction {
