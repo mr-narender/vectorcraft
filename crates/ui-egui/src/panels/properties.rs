@@ -462,7 +462,7 @@ fn multi_color(app: &mut VectorcraftApp, ctx: &egui::Context) -> bool {
 /// Edit Artboards (the Artboard tool): the active artboard's name, which can be edited to rename
 /// it, and the Artboard Options icon; its position and size, its preset and
 /// orientation (#671) (with Scale Artwork with Artboard on, a new size scales its art, #602; a new
-/// W or H, preset or orientation goes to every selected artboard, in one undo step), its Fill (background color), Move
+/// W or H, preset or orientation goes to every selected artboard, in one undo step), its Fill (background color, also for every selected artboard), Move
 /// and Scale Artwork with Artboard, New Artboard and Delete Artboard, and Quick Actions: Rearrange All (#681) and
 /// Exit back to the Selection tool (#530).
 fn artboard_sections(app: &mut VectorcraftApp, ui: &mut Ui) {
@@ -681,8 +681,11 @@ fn artboard_fill_row(app: &mut VectorcraftApp, ui: &mut Ui, i: usize, color: Opt
             None => {}
         }
     });
+    // A Fill chosen from the list goes to every selected artboard, in one undo step (#5698).
     if let Some(c) = set {
-        app.run("artboard.setProps", json!({"index": i, "color": c.as_ref().map(super::color_json)})).ok();
+        let color = c.as_ref().map(super::color_json);
+        let indices = super::artboards::renamed_with(app, i);
+        super::artboards::set_props(app, &indices, json!({}), |j, _| Some(json!({"index": j, "color": color}))).ok();
     }
     if pick {
         app.run("ui.colorPicker", json!({"artboard": i})).ok();
@@ -1004,7 +1007,8 @@ pub fn type_sections(app: &mut VectorcraftApp, ui: &mut Ui) {
     super::character::variable_font(app, ui, &s, w - 4.0);
     super::character::metrics_grid(app, ui, "props-char", &s, w, false);
     section_header(ui, tl!("Paragraph"));
-    // As in the Paragraph panel: the seven alignments and Hyphenate (#775); the rest is there.
+    // As in the Paragraph panel: the seven alignments and Hyphenate (#775), and area type's
+    // vertical alignment (#3759); the rest is there.
     if let Some((_, para)) = super::character::text_style(app) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 3.0;
@@ -1013,9 +1017,18 @@ pub fn type_sections(app: &mut VectorcraftApp, ui: &mut Ui) {
                 app.ui.open_panel = Some("paragraph".into());
             }
         });
+        // Area type: its vertical alignment in the frame (#3759).
+        if vertical_align::shown(app).is_some() {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                vertical_align::buttons(app, ui, 24.0);
+            });
+        }
         super::paragraph::hyphenate_check(app, ui, &para);
     }
 }
+
+pub(crate) mod vertical_align;
 
 #[cfg(test)]
 mod tests;

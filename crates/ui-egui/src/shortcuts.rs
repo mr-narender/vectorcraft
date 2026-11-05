@@ -350,10 +350,12 @@ pub fn handle(app: &mut VectorcraftApp, ctx: &egui::Context) {
     let row_key = |chord: &craft_keymap::Chord| {
         rows_keys && chord.is_plain() && !chord.mods.shift && matches!(chord.key, craft_keymap::Key::Delete | craft_keymap::Key::Backspace)
     };
+    // An Escape that ended a ruler-origin drag or floating Tools move runs no command bound to it.
+    let gesture_escape = |chord: &craft_keymap::Chord| escape_ended_gesture && chord.is_plain() && chord.key == craft_keymap::Key::Escape;
     let hits = dispatch(app, ctx, |hit| {
         let chord = &hit.trigger.chord;
         let shifted_punctuation = chord.mods.shift && chord.key.name().chars().all(|c| !c.is_alphanumeric());
-        !(chord.is_plain() && types_text(chord.key) && !shifted_punctuation || row_key(chord))
+        !(chord.is_plain() && types_text(chord.key) && !shifted_punctuation || row_key(chord) || gesture_escape(chord))
     });
     let ran = !hits.is_empty();
     for c in hits {
@@ -929,7 +931,7 @@ fn latin(text: &str, physical: Option<Key>) -> String {
 /// types at most one text. A text takes the press after it only when every later text in the same
 /// run of alternating texts and presses has a press after it too; otherwise the text after that
 /// press takes it as the press before it, and this text has none.
-fn typing_presses(events: &[egui::Event]) -> Vec<Option<usize>> {
+pub(crate) fn typing_presses(events: &[egui::Event]) -> Vec<Option<usize>> {
     let is_press = |k: usize| matches!(events.get(k), Some(egui::Event::Key { key, pressed: true, .. }) if !is_modifier(*key));
     let is_text = |k: usize| matches!(events.get(k), Some(egui::Event::Text(_)));
     // Whether the run of alternating texts and presses that starts with the text at `j` ends
