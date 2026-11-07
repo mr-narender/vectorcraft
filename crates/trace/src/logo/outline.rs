@@ -25,6 +25,9 @@ pub(crate) struct Style {
     pub max_dev: f64,
     /// Spacing of the points of the fit that this check looks at.
     pub check_step: f64,
+    /// Straight pieces within a few degrees of level or upright are made exactly so (by the
+    /// tracer's other modes; Flat Logo leaves them).
+    pub upright: bool,
 }
 
 impl Default for Style {
@@ -42,6 +45,7 @@ impl Default for Style {
             restore: Some(RestoreParams::default()),
             max_dev: 1.4,
             check_step: 0.03,
+            upright: false,
         }
     }
 }
@@ -363,6 +367,36 @@ mod tests {
         let segs = fit_outline(&raw, &style, &mut st);
         assert_eq!(st.reverted, 1);
         assert!(segs.is_some_and(|s| !s.is_empty()));
+    }
+
+    #[test]
+    fn a_short_run_between_corners_keeps_to_the_tolerance() {
+        let run = [(0.0, 0.0), (0.12, 0.0), (0.24, 0.6), (0.36, 0.0), (0.48, 0.0)].map(|(x, y)| Point::new(x, y));
+        let (st, sg) = (Style::default(), 0.5);
+        let mut segs = Vec::new();
+        fit_run(&run, sg, &st, &mut Stats::default(), &mut segs);
+        let samples = sample_cubics(&segs, 0.001);
+        for q in smooth_open(&run, sg) {
+            let d = samples.iter().map(|s| s.distance(q)).fold(f64::MAX, f64::min);
+            assert!(d <= st.tol + 1e-3, "{q:?} is {d} from the fit");
+        }
+    }
+
+    #[test]
+    fn a_plain_fit_keeps_a_ragged_outline_within_the_tolerance() {
+        let raw: Vec<Point> = (0..120)
+            .map(|i| {
+                let a = i as f64 / 120.0 * std::f64::consts::TAU;
+                let r = 12.0 + if i % 2 == 0 { 1.0 } else { -1.0 } * (0.2 + i as f64 * 0.02);
+                Point::new(25.0 + r * a.cos(), 25.0 + r * a.sin())
+            })
+            .collect();
+        let tol = Style::default().tol;
+        let samples = sample_cubics(&plain_fit(&raw, tol), 0.005);
+        for q in &raw {
+            let d = samples.iter().map(|s| s.distance(*q)).fold(f64::MAX, f64::min);
+            assert!(d <= tol + 1e-2, "{q:?} is {d} from the fit");
+        }
     }
 
     #[test]

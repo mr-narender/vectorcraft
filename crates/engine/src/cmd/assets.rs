@@ -7,8 +7,8 @@ use serde_json::{Map, Value, json};
 use vectorcraft_doc::{ExportAsset, NodeId};
 
 use super::edit::{roots_of, selected_roots};
-use super::fileio::{SCREEN_SETTINGS_KEYS, check_screen_settings, export_screens, store_screen_settings};
-use super::*;
+use super::fileio::{SCREEN_SETTINGS_KEYS, check_screen_settings, export_crop, export_screens, store_screen_settings, with_screen_export_preset};
+use super::{CommandSpec, EngineError, Result, Session, bad, bool_or, checked_ids_param, cmd, has_doc, ok, str_param};
 
 /// The longest asset name kept (characters).
 const MAX_NAME: usize = 255;
@@ -20,7 +20,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Collect for Export",
             ["Object", "Collect for Export"],
             None,
-            "{ids?: [id…] (default: the selected objects), multiple?: true (an asset per object; false: one asset of them all), name?: (the asset's name, when it makes one)} collect art as assets for Window › Asset Export and Export for Screens' Assets tab, named after the object (else Asset 1, Asset 2…); art already collected as such an asset keeps it → {assets: [asset id…] (in order), added: n}. Assets follow their art: moving it moves the crop, deleting it removes it from the asset",
+            "{ids?: [id…] (default: the selected objects; a layer id collects the art under it, including in its sublayers), multiple?: true (an asset per object; false: one asset of them all), name?: (the asset's name, when it makes one)} collect art as assets for Window › Asset Export and Export for Screens' Assets tab, named after the object (else Asset 1, Asset 2…); art already collected as such an asset keeps it → {assets: [asset id…] (in order), added: n}. Assets follow their art: moving it moves the crop, deleting it removes it from the asset",
             has_doc,
             add
         ),
@@ -39,7 +39,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Assets",
             [],
             None,
-            "{} → {assets: [{id, name, nodes: [id…], bounds: [x, y, width, height] | null (the crop: the visual bounds of its art)}]} the Asset Export panel's assets, in order",
+            "{} → {assets: [{id, name, nodes: [id…], bounds: [x, y, width, height] | null (the crop: the bounds the renderer measures for what its art draws, effects included)}]} the Asset Export panel's assets, in order",
             has_doc,
             list
         ),
@@ -48,7 +48,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Export Assets",
             [],
             None,
-            "{assets?: [asset id…] (default all), folder?, zip?, openLocation?, formats?, preset?, settings?, prefix?, subfolders?, antiAlias?} each asset's art alone, cropped to it, in every format row: document.exportForScreens {assets} at the document's export settings (document.exportSettings) under the ones given → what document.exportForScreens returns (no folder: the files, or one zip, as dataBase64). Leaves the remembered settings as they are (assets.settings.set changes them)",
+            "{assets?: [asset id…] (default all), folder?, zip?, openLocation?, formats?, preset?, settings?, prefix?, subfolders?, antiAlias?} each asset's art alone, cropped to it, in every format row: document.exportForScreens {assets} at the document's export settings (document.exportSettings) under the ones given; with subfolders false every file goes into the folder itself, mobile and density rows too → what document.exportForScreens returns (no folder: the files, or one zip, as dataBase64). Leaves the remembered settings as they are (assets.settings.set changes them)",
             has_doc,
             export
         ),
@@ -57,7 +57,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Asset Export Settings",
             [],
             None,
-            "{formats?, preset?: mobile|density|\"\" (none), settings?, prefix?, subfolders?, antiAlias?} change the export settings the Asset Export panel and Export for Screens share (document.exportSettings; the values of document.exportForScreens; null removes one): formats replace a preset, a preset replaces the formats → {settings}. Not an undo step",
+            "{exportPreset?: (a preset of document.exportPresets.list: its formats or preset, its format settings over the saved ones, its prefix (none when it has none), its folders (or subfolders: rows or none) with subfolders on for rows, and antiAlias; the other keys go over it), formats?, preset?: mobile|density|\"\" (none), settings?, prefix?, subfolders?, antiAlias?} change the export settings the Asset Export panel and Export for Screens share (document.exportSettings; the values of document.exportForScreens; null removes one): formats replace a preset, a preset replaces the formats → {settings}. Not an undo step",
             has_doc,
             settings_set
         ),
@@ -65,7 +65,7 @@ pub fn specs() -> Vec<CommandSpec> {
 }
 
 /// `e` as an error of command `cmd` (for errors of the export underneath).
-fn of_cmd(cmd: &str, e: EngineError) -> EngineError {
+pub(crate) fn of_cmd(cmd: &str, e: EngineError) -> EngineError {
     match e {
         EngineError::BadParams { msg, .. } => bad(cmd, msg),
         e => e,
@@ -78,13 +78,32 @@ fn clean_name(name: &str) -> Option<String> {
     (!n.is_empty()).then_some(n)
 }
 
+/// Ids of art under `id`: the id itself when it is not a layer, else every non-layer under it
+/// (sublayers unfolded). Layers alone have nothing to collect.
+pub(crate) fn art_under(doc: &vectorcraft_doc::Document, id: NodeId, out: &mut Vec<NodeId>) {
+    let Some(n) = doc.node(id) else { return };
+    if n.is_layer() {
+        if let Some(kids) = n.children() {
+            for c in kids {
+                art_under(doc, c.id, out);
+            }
+        }
+        return;
+    }
+    out.push(id);
+}
+
 fn add(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "assets.add";
     let ids = if p.get("ids").is_some_and(|v| !v.is_null()) {
         // An explicit list is authoritative: never silently drop malformed or stale ids.
         let ids = checked_ids_param(s, p, "ids", C)?;
         let d = &s.doc()?.doc;
-        roots_of(d, d.paint_order(ids))
+        let mut art = Vec::new();
+        for id in &ids {
+            art_under(d, *id, &mut art);
+        }
+        roots_of(d, d.paint_order(art))
     } else {
         selected_roots(s)?
     };
@@ -161,7 +180,7 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
         .assets
         .iter()
         .map(|a| {
-            let bounds = a.nodes.iter().filter_map(|id| d.node(*id)?.visual_bounds()).reduce(|x, y| x.union(y));
+            let bounds = export_crop(d, &a.nodes);
             json!({
                 "id": a.id,
                 "name": a.name,
@@ -204,6 +223,10 @@ fn export(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(o) = p.as_object() {
         overlay(&mut q, o);
     }
+    // Create Sub-folders off puts every file in the folder itself, mobile and density rows too.
+    if q.get("subfolders").and_then(Value::as_bool) == Some(false) && p.get("folders").is_none() {
+        q.insert("folders".into(), json!("none"));
+    }
     if !q.contains_key("assets") {
         let all: Vec<u64> = s.doc()?.doc.assets.iter().map(|a| a.id).collect();
         if all.is_empty() {
@@ -217,11 +240,22 @@ fn export(s: &mut Session, p: &Value) -> Result<Value> {
 fn settings_set(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "assets.settings.set";
     let o = p.as_object().ok_or_else(|| bad(C, "give the settings to change, e.g. {\"formats\": [{\"format\": \"png\", \"scale\": \"2x\"}]}"))?;
-    if let Some(k) = o.keys().find(|k| !SCREEN_SETTINGS_KEYS.contains(&k.as_str())) {
+    if let Some(k) = o.keys().find(|k| !SCREEN_SETTINGS_KEYS.contains(&k.as_str()) && k.as_str() != "exportPreset") {
         return Err(bad(C, format!("`{k}` isn't an export setting: {}", SCREEN_SETTINGS_KEYS.join(", "))));
     }
     let mut settings = s.doc()?.doc.export_settings.clone();
-    overlay(&mut settings, o);
+    let mut given = o.clone();
+    if let Some(name) = given.remove("exportPreset") {
+        let name = name.as_str().ok_or_else(|| bad(C, "`exportPreset` is the name of a preset of document.exportPresets.list"))?;
+        with_screen_export_preset(s, C, &mut settings, name)?;
+    }
+    // Create Sub-folders is Export for Screens' folder per row: the dialog opens on the choice.
+    match given.get("subfolders").and_then(Value::as_bool) {
+        Some(true) => _ = settings.insert("folders".into(), json!("rows")),
+        Some(false) if settings.get("folders").and_then(Value::as_str) == Some("rows") => _ = settings.insert("folders".into(), json!("none")),
+        _ => {}
+    }
+    overlay(&mut settings, &given);
     check_screen_settings(s, &Value::Object(settings.clone())).map_err(|e| of_cmd(C, e))?;
     store_screen_settings(s, settings)?;
     Ok(json!({ "settings": shared_settings(s)? }))
