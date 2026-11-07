@@ -10,7 +10,7 @@ use kurbo::{Affine, Rect};
 use serde::Serialize;
 use vectorcraft_doc::marks::outset;
 use vectorcraft_doc::range::parse_range;
-use vectorcraft_doc::{Document, Node, NodeKind};
+use vectorcraft_doc::{Document, Node, NodeKind, SymbolBoxes};
 
 use super::{Emulsion, Orientation, PrintArtboards, PrintScaling, PrintSettings};
 use crate::PdfError;
@@ -63,8 +63,9 @@ pub struct TileGrid {
 }
 
 /// Calls `f` with the bounds of each object of `n` that prints: visible, not on a template
-/// layer and not a guide (layers are already picked by the Print Layers option).
-fn printed(n: &Node, f: &mut impl FnMut(Rect)) {
+/// layer and not a guide (layers are already picked by the Print Layers option). Symbol
+/// instances are measured by their art from `symbols`.
+fn printed(n: &Node, symbols: &SymbolBoxes, f: &mut impl FnMut(Rect)) {
     if !n.visible {
         return;
     }
@@ -72,31 +73,34 @@ fn printed(n: &Node, f: &mut impl FnMut(Rect)) {
         NodeKind::Layer { template: true, .. } | NodeKind::Path { guide: true, .. } => {}
         NodeKind::Layer { children, .. } | NodeKind::Group { children, clip: false } => {
             for c in children {
-                printed(c, f);
+                printed(c, symbols, f);
             }
         }
         _ => {
-            if let Some(b) = n.visual_bounds() {
+            if let Some(b) = n.visual_bounds_with(symbols) {
                 f(b);
             }
         }
     }
 }
 
-/// Is there art that prints in `r`?
+/// Is there art that prints in `r`? The box of a symbol instance whose art holds brushed strokes
+/// grows by as far as their brush art can paint ([`SymbolBoxes::with_brush_art`]).
 fn has_art(doc: &Document, r: Rect) -> bool {
+    let symbols = doc.symbol_boxes().with_brush_art();
     let mut any = false;
     for l in &doc.layers {
-        printed(l, &mut |b| any |= b.intersect(r).area() > 0.0 || r.contains_rect(b));
+        printed(l, &symbols, &mut |b| any |= b.intersect(r).area() > 0.0 || r.contains_rect(b));
     }
     any
 }
 
 /// The bounds of all the art that prints.
 fn art_bounds(doc: &Document) -> Option<Rect> {
+    let symbols = doc.symbol_boxes();
     let mut all: Option<Rect> = None;
     for l in &doc.layers {
-        printed(l, &mut |b| all = Some(all.map_or(b, |a| a.union(b))));
+        printed(l, &symbols, &mut |b| all = Some(all.map_or(b, |a| a.union(b))));
     }
     all
 }
@@ -161,6 +165,10 @@ fn turns(set: &PrintSettings, (w, h): (f64, f64), flipped: bool) -> (Affine, (f6
     (v, (w, h))
 }
 
+fn too_many_pages() -> PdfError {
+    PdfError::BadSetting(format!("the job would print more than {} pages", super::MAX_PAGES))
+}
+
 /// The pages of `doc` (whose layers are those that print) as `set` lays them out, the tiles of
 /// each artboard when tiling, and warnings (art that doesn't fit the imageable area).
 pub(crate) fn layout(doc: &Document, set: &PrintSettings, warnings: &mut Vec<String>) -> Result<(Vec<Layout>, Vec<TileGrid>), PdfError> {
@@ -170,6 +178,10 @@ pub(crate) fn layout(doc: &Document, set: &PrintSettings, warnings: &mut Vec<Str
     let origin = set.tile_origin.placed.then_some((set.tile_origin.x, set.tile_origin.y));
     let (mut pages, mut grids) = (vec![], vec![]);
     for (artboard, r) in regions(doc, set)? {
+        // The job is refused past MAX_PAGES (copies and inks only add to it): stop making pages here.
+        if pages.len() > super::MAX_PAGES {
+            return Err(too_many_pages());
+        }
         let what = artboard.map_or_else(|| "The art".to_string(), |i| format!("Artboard {}", i + 1));
         if !(r.width() > 0.0 && r.height() > 0.0) {
             warnings.push(format!("{what} has no area and was left out"));
@@ -293,6 +305,9 @@ pub(crate) fn layout(doc: &Document, set: &PrintSettings, warnings: &mut Vec<Str
             let (x, y) = (grid.0 + c * step.0, grid.1 + rw * step.1);
             Rect::new(x, y, x + tile.0, y + tile.1)
         };
+        if pages.len() + pick.len() > super::MAX_PAGES {
+            return Err(too_many_pages());
+        }
         for &t in &pick {
             let w = window(t);
             let view = turn * Affine::translate((at.0 - w.x0, at.1 - w.y0));
