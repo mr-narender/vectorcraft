@@ -171,6 +171,7 @@ fn paint_only_keeps_every_nonpaint_attribute_and_partial_equality() {
         b.stroke_dash = a.stroke_dash.clone();
         b.stroke_align = a.stroke_align;
         b.style_name = a.style_name.clone();
+        b.kerning_before = a.kerning_before;
         *a == b
     }
 
@@ -203,6 +204,7 @@ fn paint_only_keeps_every_nonpaint_attribute_and_partial_equality() {
     field!(leading, Some(60.0), false);
     field!(tracking, 20.0, false);
     field!(kerning, Some(0.0), false);
+    field!(kerning_before, 250.0, true);
     field!(optical_kerning, true, false);
     field!(baseline_shift, 1.0, false);
     field!(h_scale, 90.0, false);
@@ -312,6 +314,36 @@ fn harakat_ranges_normalise_their_range() {
 /// the same way, and only a character in that glyph's shaping cluster: repeated glyph ids alone
 /// don't do. A later in-cluster owner is kept only for a GDEF mark glyph on a harakat character;
 /// everything else stays at the cluster start (conservative).
+/// A space before the line's first letter (#5111), set on the letter alone as the Type tool's caret
+/// sets it, keeps the letter's harakat coloured apart attached and in their own colour. Right to
+/// left the space is past the letter's right side, so every glyph stays where it was and the line
+/// is the space longer. Checked with the in-memory Arabic test font (its fatha a `GDEF` mark) in
+/// every environment, and with an installed Arabic face when there is one.
+#[test]
+fn a_space_before_the_first_letter_keeps_its_coloured_harakat() {
+    let db = FontDb::with_font_dirs(vec![]);
+    assert_eq!(db.add_font(crate::test_fonts::lam_alef_font(b"rlig").unwrap()), 1);
+    check_spaced_harakat(&db, crate::test_fonts::lam_alef_family(b"rlig"));
+    if let Some(face) = arabic_face("a_space_before_the_first_letter_keeps_its_coloured_harakat") {
+        check_spaced_harakat(FontDb::global(), &face.family);
+    }
+}
+
+fn check_spaced_harakat(db: &FontDb, family: &str) {
+    const WORD: &str = "بَبَب"; // ب 0, fatha 2, ب 4, fatha 6, ب 8
+    let coloured = text_with_harakat(WORD, family, Some(red()));
+    let mut spaced = coloured.clone();
+    crate::edit::style_range(&mut spaced.runs, 0, 2, |st| st.kerning_before = 250.0);
+    let (a, b) = (layout(db, &coloured), layout(db, &spaced));
+    let placed = |l: &TextLayout| l.glyphs.iter().map(|g| (g.font_id, g.gid, g.byte, g.xf.as_coeffs().map(f64::to_bits))).collect::<Vec<_>>();
+    assert_eq!(placed(&a), placed(&b), "{family}: the same glyphs where they were");
+    assert!(painted(&spaced, &b, &red()) > 0, "{family}: harakat painted apart");
+    assert_eq!(painted(&spaced, &b, &red()), painted(&coloured, &a, &red()), "{family}: the harakat keep their colour");
+    // 250/1000 of the 48 pt em.
+    let length = |l: &TextLayout| l.glyphs.iter().map(|g| g.advance).sum::<f64>();
+    assert!((length(&b) - length(&a) - 12.0).abs() < 1e-6, "{family}: {} → {}", length(&a), length(&b));
+}
+
 #[test]
 fn own_chars_need_the_same_setting_and_each_character_in_its_cluster() {
     // بَبَب right to left: final beh (cluster 8), fatha and medial beh (cluster 4), fatha and
@@ -512,6 +544,43 @@ fn assert_authored_ownership(t: &TextObject, text: &str, l: &TextLayout, what: &
     }
 }
 
+/// Repeated glyphs in one cluster can belong to differently painted runs. Match each authored
+/// occurrence in order, without needing an installed font, and still reject a changed owner.
+#[test]
+fn duplicate_authored_glyphs_keep_occurrence_order() {
+    let mut text = TextObject::point(Point::ZERO, "\u{0651}", style(FAMILY));
+    text.runs.push(vectorcraft_doc::TextRun::new("\u{0651}", CharStyle { fill: red(), ..style(FAMILY) }));
+    let glyph = |run| PositionedGlyph {
+        outline: Default::default(),
+        run,
+        byte: 0,
+        origin: Point::ZERO,
+        advance: 0.0,
+        len: 4,
+        angle: 0.0,
+        line: 0,
+        font_id: 0,
+        gid: 7,
+        xf: Affine::IDENTITY,
+        rtl: true,
+        scale: 1.0,
+        image: None,
+        colour: None,
+        bend: None,
+        unturned: Affine::IDENTITY,
+        pivot: Point::ZERO,
+        carets: Vec::new(),
+        width: 0.0,
+        width_start: 0.0,
+    };
+    let before = TextLayout { glyphs: vec![glyph(0), glyph(1)], ..TextLayout::default() };
+    assert_eq!(assert_kashida_ownership(&text, &before, &before, &red(), "duplicate glyphs", false), 0);
+
+    let mut wrong = before.clone();
+    wrong.glyphs[0].run = 1;
+    assert!(std::panic::catch_unwind(|| assert_kashida_ownership(&text, &before, &wrong, &red(), "changed owner", false)).is_err());
+}
+
 /// Compare authored glyph run indices before/after Insert Kashidas (matched by byte and gid;
 /// layout order can differ between point and justified area), and assert every inserted tatweel
 /// uses the base letter's paint at the cluster start—not `mark_fill`. When `require_mark_last`,
@@ -525,16 +594,17 @@ fn assert_kashida_ownership(
     what: &str,
     require_mark_last: bool,
 ) -> usize {
-    let mut before_runs: std::collections::HashMap<(usize, u32), Vec<usize>> = std::collections::HashMap::new();
+    let mut before_runs: std::collections::HashMap<(usize, u32), std::collections::VecDeque<usize>> = std::collections::HashMap::new();
     for g in before.glyphs.iter().filter(|g| g.len > 0) {
-        before_runs.entry((g.byte, g.gid)).or_default().push(g.run);
+        before_runs.entry((g.byte, g.gid)).or_default().push_back(g.run);
     }
     let mut after_n = 0;
     for g in with_kashida.glyphs.iter().filter(|g| g.len > 0) {
         after_n += 1;
         let runs =
             before_runs.get_mut(&(g.byte, g.gid)).unwrap_or_else(|| panic!("{what}: authored glyph {} at {} missing before kashida", g.gid, g.byte));
-        let want_run = runs.pop().unwrap_or_else(|| panic!("{what}: no remaining before-run for {} at {}", g.gid, g.byte));
+        // Duplicate glyphs at the same cluster byte retain their occurrence order.
+        let want_run = runs.pop_front().unwrap_or_else(|| panic!("{what}: no remaining before-run for {} at {}", g.gid, g.byte));
         assert_eq!(g.run, want_run, "{what}: authored run at {} gid {}", g.byte, g.gid);
         let want_fill = coloured.runs.get(want_run).map(|r| &r.style.fill).unwrap_or_else(|| panic!("{what}: missing run {want_run}"));
         assert_eq!(&run_of(coloured, g).style.fill, want_fill, "{what}: authored fill at {}", g.byte);

@@ -1,6 +1,6 @@
 use super::area::{AreaOptions, PathAlign, PathEffect};
 use super::char_style::CharStyle;
-use super::para_style::ParaStyle;
+use super::para_style::{JustificationOptions, ParaStyle};
 use super::runs::{RubySpan, TextKind, TextRun, TypeAntiAlias, move_anchors, reverse_from_end};
 use super::tabs_lists::{ListCounts, ParaList};
 use super::{Affine, PathData, Point, Rect, TextObject, TextStyleScale, Vec2};
@@ -89,6 +89,7 @@ impl TextObject {
             path_effect: PathEffect::default(),
             path_align: PathAlign::default(),
             path_spacing: 0.0,
+            dynamic_text: false,
             wrap: Vec::new(),
             optical_margin: false,
             anti_alias: TypeAntiAlias::Sharp,
@@ -168,6 +169,19 @@ impl TextObject {
     /// Attributes of paragraph `i` (the last paragraph's past the end).
     pub fn para_at(&self, i: usize) -> &ParaStyle {
         self.paras.get(i).or(self.paras.last()).unwrap_or(&self.para)
+    }
+    /// The Justification… options the layout sets `para` with: its own, except that with Dynamic
+    /// Text's Block on area type ([`Self::dynamic_text`]) the Desired word spacing is the word gap
+    /// ([`AreaOptions::block_gaps`]), and Minimum and Maximum move out to it when it lies outside
+    /// them. The paragraph keeps its own values, which apply again when Block is off.
+    pub fn layout_justification(&self, para: &ParaStyle) -> JustificationOptions {
+        let mut j = para.justification.clone();
+        if self.dynamic_text && matches!(self.kind, TextKind::Area { .. }) {
+            let gap = self.area.block_gaps().0;
+            let [min, _, max] = j.word_spacing;
+            j.word_spacing = [min.min(gap), gap, max.max(gap)];
+        }
+        j
     }
     /// Every paragraph's attributes, one per paragraph.
     pub fn paragraph_styles(&self) -> Vec<ParaStyle> {
@@ -366,6 +380,24 @@ impl TextObject {
     /// exist, a degenerate `xf` or a path that would not be finite.
     pub fn move_path_anchors(&mut self, refs: &[(usize, usize)], d: Vec2) -> bool {
         matches!(self.kind, TextKind::OnPath { .. }) && self.reshape_local(|path, to_text| move_anchors(path, to_text, refs, d))
+    }
+    /// Move the out (`out`) or in direction handle of anchor `ai` of subpath `si` of type on a
+    /// path's path to `pos` in document space, as a path's anchor takes it
+    /// ([`vectorcraft_geom::Anchor::set_handle`]; `independent`: that side only, the anchor a
+    /// corner): a Direct Selection drag of a handle (#3565). The handle is set in document space,
+    /// so a smooth anchor keeps its other handle's length as drawn; the brackets keep their
+    /// fractions of the path. False, changing nothing, for other type, when the anchor doesn't
+    /// exist, a degenerate `xf` or a path that would not be finite.
+    pub fn set_path_handle(&mut self, (si, ai): (usize, usize), out: bool, pos: Point, independent: bool) -> bool {
+        let xf = self.xf;
+        matches!(self.kind, TextKind::OnPath { .. })
+            && self.reshape_local(|path, to_text| {
+                let Some(a) = path.anchor_mut(si, ai) else { return false };
+                let mut drawn = a.transform(xf);
+                drawn.set_handle(out, pos, independent);
+                *a = drawn.transform(to_text);
+                true
+            })
     }
     /// Edit a copy of the area frame with `f` (given the document → text space map) and keep it
     /// when `f` succeeds and the result is finite.

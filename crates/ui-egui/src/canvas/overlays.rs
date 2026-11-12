@@ -106,6 +106,7 @@ pub(super) fn mark_options(app: &VectorcraftApp, curve_points_from_tool: bool) -
     }
 }
 
+/// Draw selection marks and widgets, keeping the box but hiding dot marks during Halftone Preview.
 pub(super) fn selection_overlay(app: &mut VectorcraftApp, p: &egui::Painter, xf: &Xf, curve_points_from_tool: bool, marks: &mut SelectionMarks) {
     // The Selection tool's bounding box (rotated with the objects after a rotation), also shown by
     // the shape tools that keep a shape just drawn ready to adjust while they draw none (#5477). It
@@ -122,7 +123,7 @@ pub(super) fn selection_overlay(app: &mut VectorcraftApp, p: &egui::Painter, xf:
     // shows while the key is down, where its handles take that press.
     let held = super::drag::mods(p.ctx().input(|i| i.modifiers), false);
     let lends_selection = !app.session.tool_busy() && app.session.lent_tool_id(&held) == Some("selection");
-    let show_box = (app.session.tool_id() == "selection" || lends_selection || (shape_tool && !app.session.tool_busy()))
+    let show_box = (app.session.tool_id() == "selection" || lends_selection || (shape_tool && (!app.session.tool_busy() || resizing)))
         && (resizing || !app.session.tool_transforming() || moved.is_some())
         && app.ui.view.bounding_box
         && app.session.active().is_some_and(|st| !st.selection.is_empty() && st.selection.anchors.is_empty());
@@ -140,7 +141,8 @@ pub(super) fn selection_overlay(app: &mut VectorcraftApp, p: &egui::Painter, xf:
         None => b,
     });
     let st = app.session.active();
-    let big = st.is_some_and(|st| too_many_anchors(st.selection.objects.iter().filter_map(|id| st.doc.node(*id))));
+    let show_marks = !crate::dialogs::halftone::previewing(app);
+    let big = show_marks && st.is_some_and(|st| too_many_anchors(st.selection.objects.iter().filter_map(|id| st.doc.node(*id))));
     let big_bounds = if big { app.selection_bounds() } else { None };
     let app = &*app;
     let Some(st) = app.session.active() else { return };
@@ -152,24 +154,27 @@ pub(super) fn selection_overlay(app: &mut VectorcraftApp, p: &egui::Painter, xf:
     let options = mark_options(app, curve_points_from_tool);
     let grow = options.look.grow;
     let anchor = |direct: bool| grow + if direct { 5.0 } else { 4.0 };
-    // Too many paths to outline: the selection's bounds stand for them.
-    if let Some((b, id)) = big_bounds.zip(st.selection.objects.first()) {
-        stroke_path(p, &vectorcraft_geom::shapes::rectangle(b).to_bezpath(), xf, Stroke::new(1.0, c32(st.doc.layer_color(*id))));
+    // The temporary halftone selects its dots; their marks obscure the art (#6369).
+    if show_marks {
+        // Too many paths to outline: the selection's bounds stand for them.
+        if let Some((b, id)) = big_bounds.zip(st.selection.objects.first()) {
+            stroke_path(p, &vectorcraft_geom::shapes::rectangle(b).to_bezpath(), xf, Stroke::new(1.0, c32(st.doc.layer_color(*id))));
+        }
+        // The key object (Align to Key Object): its outline drawn thicker, or its bounds when it has
+        // too many paths to outline.
+        let key = st.selection.key.and_then(|k| Some((k, st.doc.node(k)?)));
+        let (key_bounds, key_outline) = match key {
+            Some((k, n)) if too_many_anchors([n]) => (Some((k, n)), None),
+            Some((k, _)) => (None, Some(k)),
+            None => (None, None),
+        };
+        if let Some((k, n)) = key_bounds
+            && let Some(b) = n.geometric_bounds_with(&symbols)
+        {
+            stroke_path(p, &vectorcraft_geom::shapes::rectangle(b).to_bezpath(), xf, Stroke::new(KEY_OUTLINE, c32(st.doc.layer_color(k))));
+        }
+        marks.paint(st, p, xf, &options, key_outline, if big { &[] } else { &st.selection.objects });
     }
-    // The key object (Align to Key Object): its outline drawn thicker, or its bounds when it has
-    // too many paths to outline.
-    let key = st.selection.key.and_then(|k| Some((k, st.doc.node(k)?)));
-    let (key_bounds, key_outline) = match key {
-        Some((k, n)) if too_many_anchors([n]) => (Some((k, n)), None),
-        Some((k, _)) => (None, Some(k)),
-        None => (None, None),
-    };
-    if let Some((k, n)) = key_bounds
-        && let Some(b) = n.geometric_bounds_with(&symbols)
-    {
-        stroke_path(p, &vectorcraft_geom::shapes::rectangle(b).to_bezpath(), xf, Stroke::new(KEY_OUTLINE, c32(st.doc.layer_color(k))));
-    }
-    marks.paint(st, p, xf, &options, key_outline, if big { &[] } else { &st.selection.objects });
     // The spine of each selected blend (or of the blend a selected key object belongs to).
     let mut spines = vec![];
     for id in &st.selection.objects {
@@ -233,7 +238,7 @@ pub(super) fn selection_overlay(app: &mut VectorcraftApp, p: &egui::Painter, xf:
     rotate_all_widget(p, xf, tool, &st.doc, &st.selection);
 }
 
-/// The Rotate All and Space widgets (Selection and Objects on Path tools, one Objects on Path
+/// The Rotate All, Space and Move All widgets (Selection and Objects on Path tools, one Objects on Path
 /// group selected). The Rotate All widget is joined by a line to the first object's attachment
 /// point. It stays while dragged.
 fn rotate_all_widget(p: &egui::Painter, xf: &Xf, tool: &str, doc: &vectorcraft_doc::Document, selection: &vectorcraft_doc::Selection) {
@@ -248,6 +253,7 @@ fn rotate_all_widget(p: &egui::Painter, xf: &Xf, tool: &str, doc: &vectorcraft_d
         p.circle_stroke(c, ROTATE_ALL_RADIUS_PX, Stroke::new(1.0, color));
     }
     space_widget(p, xf, doc, selection);
+    move_all_widget(p, xf, doc, selection);
 }
 
 /// The Space widget (beside the Rotate All widget, with two or more objects on the path): a square
@@ -260,6 +266,19 @@ fn space_widget(p: &egui::Painter, xf: &Xf, doc: &vectorcraft_doc::Document, sel
     p.line_segment([on, c], Stroke::new(1.0, color));
     p.rect_filled(r, 0.0, Color32::WHITE);
     p.rect_stroke(r, 0.0, Stroke::new(1.0, color), StrokeKind::Inside);
+}
+
+/// The Move All widget (beside the Rotate All widget, when the objects have room to move along the
+/// path): a diamond below the first object joined by a line to its attachment point. It stays while
+/// dragged.
+fn move_all_widget(p: &egui::Painter, xf: &Xf, doc: &vectorcraft_doc::Document, selection: &vectorcraft_doc::Selection) {
+    use vectorcraft_tools::objects_on_path::{MOVE_ALL_HALF_PX, MoveAllWidget};
+    let Some(w) = MoveAllWidget::of(doc, selection, xf.zoom) else { return };
+    let (on, c, color) = (xf.to_screen(w.first), xf.to_screen(w.at), c32(doc.layer_color(w.group)));
+    let h = MOVE_ALL_HALF_PX;
+    p.line_segment([on, c], Stroke::new(1.0, color));
+    let corners = vec![c + vec2(0.0, -h), c + vec2(h, 0.0), c + vec2(0.0, h), c + vec2(-h, 0.0)];
+    p.add(Shape::convex_polygon(corners, Color32::WHITE, Stroke::new(1.0, color)));
 }
 
 /// Record where the Type tool's IME candidate window goes this pass, if it has an editor.

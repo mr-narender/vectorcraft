@@ -119,6 +119,13 @@ impl PointSnap {
         Self { targets }
     }
 
+    /// Snapping for a point placed anywhere, as a drawing tool's ([`DrawSnap`]) is: the art in the
+    /// window as targets ([`Targets::for_drawing`]), live text as Snap to Glyph asks.
+    pub fn drawn(cx: &ToolContext) -> Self {
+        let glyphs = (cx.snap_to_glyph && cx.smart_guides && cx.alignment_guides).then_some(cx.glyph_snap);
+        Self::new(cx, || Targets::for_drawing(cx.doc, &[], visible(cx), glyphs))
+    }
+
     /// Where `p` goes, and the guides showing why.
     pub fn snap(&self, cx: &ToolContext, p: Point) -> (Point, Vec<Overlay>) {
         self.snap_from(cx, p, None)
@@ -428,8 +435,12 @@ impl HandleSnap {
     /// Where the handle of anchor `ai` of subpath `si` of path `id` goes with the pointer at `p`,
     /// and the guides showing why.
     pub fn snap(&mut self, cx: &ToolContext, (id, si, ai): (NodeId, usize, usize), p: Point, shift: bool) -> (Point, Vec<Overlay>) {
-        let path = cx.doc.node(id).and_then(|n| n.path_data());
-        if shift && let Some(a) = path.and_then(|pd| pd.subpaths.get(si)?.anchors.get(ai)) {
+        // A path's anchor, or one of type on a path's path (#3565), in document space.
+        let anchor = cx.doc.node(id).and_then(|n| match &n.kind {
+            vectorcraft_doc::NodeKind::Text(t) => t.type_path()?.subpaths.get(si)?.anchors.get(ai).copied(),
+            _ => n.path_data()?.subpaths.get(si)?.anchors.get(ai).copied(),
+        });
+        if shift && let Some(a) = anchor {
             return (a.p + constrain_angle_from(p - a.p, 45.0, cx.constrain_angle), vec![]);
         }
         if self.0.targets.is_none() {

@@ -7,7 +7,6 @@ use vectorcraft_geom::hit::fill_contains;
 use vectorcraft_geom::kurbo::{ParamCurveArclen, ParamCurveExtrema, ParamCurveNearest};
 use vectorcraft_geom::{BezPath, FillRule, ParamCurve, PathSeg, Point, Rect, Shape, Vec2};
 
-use crate::appearance::HEAD_REACH;
 use crate::{Appearance, ArrowAlign, Dash, LineCap, LineJoin, StrokeAlign, StrokeLayer, WidthProfile};
 
 /// Arc-length accuracy for placing a point along a profile (document points).
@@ -81,10 +80,8 @@ fn head_ends(st: &StrokeLayer, bp: &BezPath) -> Vec<(Point, Vec2, bool)> {
 /// at `t`): the profile at that fraction of the subpath's length, or wider where an end of the
 /// segment is a corner. The stroke draws the sides there straight to the corner's join and inner
 /// meeting point, which can lie outside the exact width all along the segment.
-fn profile_at(profile: &WidthProfile, segs: &[PathSeg], closed: bool, i: usize, t: f64) -> (f64, f64) {
+fn profile_at(profile: &WidthProfile, segs: &[PathSeg], lens: &[f64], total: f64, closed: bool, i: usize, t: f64) -> (f64, f64) {
     let n = segs.len();
-    let lens: Vec<f64> = segs.iter().map(|s| s.arclen(ARCLEN_ACCURACY)).collect();
-    let total: f64 = lens.iter().sum::<f64>().max(1e-12);
     let before = lens[..i].iter().sum::<f64>();
     let mut w = profile.at((before + segs[i].subsegment(0.0..t).arclen(ARCLEN_ACCURACY)) / total);
     let corner = |a: usize, b: usize| (closed || a < b) && kink(&segs[a], &segs[b]);
@@ -307,7 +304,8 @@ impl StrokeLayer {
 
     /// Does this stroke along `bp` (filled with `rule`) paint within `tol` of `p`? Inside and
     /// outside strokes of closed paths count on their own side only (and within `tol` of the
-    /// path); a width profile counts at its width where `p` is nearest.
+    /// path); a width profile counts at the width of every segment that can reach `p`, as the
+    /// wider side of a farther one can paint past the nearest.
     pub fn hits(&self, bp: &BezPath, rule: FillRule, p: Point, tol: f64) -> bool {
         let reach = self.reach() + tol;
         if self.width.is_nan() || self.width <= 0.0 || !bp.bounding_box().inflate(reach, reach).contains(p) {
@@ -331,17 +329,27 @@ impl StrokeLayer {
             let segs = drawn(&els[r]);
             let (half, region) = self.body(closed);
             let full = half * self.profile_max() * dash_caps.unwrap_or(1.0);
-            // The nearest point on this subpath.
-            let near = segs.iter().enumerate().map(|(i, s)| (i, s.nearest(p, 1e-9))).min_by(|a, b| a.1.distance_sq.total_cmp(&b.1.distance_sq));
-            if let Some((i, nr)) = near
-                && nr.distance_sq.sqrt() <= full + tol
-            {
+            // Every segment near enough to reach `p`: with a width profile the wider side of a
+            // farther segment can paint past the nearest one, so the nearest alone is not enough.
+            let near = segs.iter().enumerate().filter_map(|(i, s)| {
+                let nr = s.nearest(p, 1e-9);
+                (nr.distance_sq.sqrt() <= full + tol).then_some((i, nr))
+            });
+            // The lengths are only needed when a profiled candidate reaches `p`; compute them
+            // once for the whole subpath rather than once per candidate.
+            let mut lengths: Option<(Vec<f64>, f64)> = None;
+            for (i, nr) in near {
                 let d = nr.distance_sq.sqrt();
                 let factor = if dash_caps.is_some() {
                     full / half.max(1e-12)
                 } else {
                     self.profile.as_ref().map_or(1.0, |pr| {
-                        let (l, rt) = profile_at(pr, &segs, closed, i, nr.t);
+                        let (lens, total) = lengths.get_or_insert_with(|| {
+                            let lens: Vec<f64> = segs.iter().map(|s| s.arclen(ARCLEN_ACCURACY)).collect();
+                            let total = lens.iter().sum::<f64>().max(1e-12);
+                            (lens, total)
+                        });
+                        let (l, rt) = profile_at(pr, &segs, lens, *total, closed, i, nr.t);
                         // Nearest to a segment's end, `p` is beside a join or past a cap, which
                         // spans the widths of both sides.
                         let at_end = nr.t <= 1e-9 || nr.t >= 1.0 - 1e-9;
@@ -386,18 +394,19 @@ impl StrokeLayer {
     }
 
     /// Is `p` within `tol` of where the start (`end == false`) or end arrowhead at `at` (the path
-    /// leaving along `out`) can paint? Heads are at most about 4.6 weights long and 4 wide. With
+    /// leaving along `out`) can paint? A head reaches [`crate::Arrowhead::reach`] weights from its tip and
+    /// [`crate::Arrowhead::half_width`] either side of its line (4.6 and 2 for most). With
     /// [`ArrowAlign::Extend`] a head points along `out` with its tip up to its length (or the cap)
     /// past the end; with [`ArrowAlign::Tip`] its tip is on the end and it lies back along the
     /// chord the path bends through under it, so anywhere within its length of the end.
     fn head_contains(&self, at: Point, out: Vec2, end: bool, p: Point, tol: f64) -> bool {
-        let hw = self.arrow_weight(end);
-        let v = p - at;
+        let Some(kind) = (if end { self.end_arrow } else { self.start_arrow }) else { return false };
+        let (hw, v) = (self.arrow_weight(end), p - at);
         match self.arrow_align {
-            ArrowAlign::Tip => v.hypot() <= HEAD_REACH * hw + tol,
+            ArrowAlign::Tip => v.hypot() <= kind.reach() * hw + tol,
             ArrowAlign::Extend => {
                 let along = v.dot(out);
-                v.cross(out).abs() <= 2.0 * hw + tol && along <= 4.0 * hw + self.width / 2.0 + tol && along >= -HEAD_REACH * hw - tol
+                v.cross(out).abs() <= kind.half_width() * hw + tol && along <= 4.0 * hw + self.width / 2.0 + tol && along >= -kind.reach() * hw - tol
             }
         }
     }
