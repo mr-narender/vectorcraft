@@ -570,8 +570,8 @@ fn envelope_warp_make_and_content_stays_inside_bounds() {
     let pts = all_anchors(&out);
     assert!(pts.len() > 4, "curves are subdivided");
     assert!(pts.iter().all(|p| b.contains(*p)), "{b:?}");
-    // It really is bent: the sides moved down.
-    assert!(pts.iter().any(|p| p.y > 201.0));
+    // It really is bent: the top corners swung out past the sides.
+    assert!(pts.iter().any(|p| p.x < 99.0) && pts.iter().any(|p| p.x > 301.0));
 }
 
 #[test]
@@ -1136,7 +1136,12 @@ fn mesh_points_move_and_colour_together() {
         assert!(s.execute("object.mesh.movePoints", &p).is_err(), "{p}");
     }
     assert!(s.execute("object.mesh.setPointColor", &json!({"id": a.0, "points": [0, 9], "color": "#000000"})).is_err());
-    assert_eq!(((mesh_of(&s, a), mesh_of(&s, b)), undo_len(&s)), (before, n), "nothing changed");
+    assert_eq!(((mesh_of(&s, a), mesh_of(&s, b)), undo_len(&s)), (before.clone(), n), "nothing changed");
+    // A call that changes no point records no undo step.
+    s.execute("object.mesh.movePoints", &json!({"id": a.0, "points": [], "dx": 1, "dy": 1})).unwrap();
+    s.execute("object.mesh.movePoints", &json!({"id": a.0, "points": [0, 1], "dx": 0, "dy": 0})).unwrap();
+    s.execute("object.mesh.setPointColor", &json!({"id": a.0, "points": [2, 6], "color": "#0000ff", "opacity": 0.25})).unwrap();
+    assert_eq!(((mesh_of(&s, a), mesh_of(&s, b)), undo_len(&s)), (before, n), "no change, no undo step");
 }
 
 #[test]
@@ -1182,6 +1187,47 @@ fn mesh_add_line_on_the_edge_from_just_outside() {
     assert!(m.points[r["index"].as_u64().unwrap() as usize].p.distance(Point::new(140.0, 200.0)) < 0.5);
     assert!(s.execute("object.mesh.addLine", &json!({"id": a.0, "x": 140, "y": 202})).is_err(), "no tolerance: outside");
     assert!(s.execute("object.mesh.addLine", &json!({"id": a.0, "x": 140, "y": 210, "tolerance": 3})).is_err(), "past the tolerance");
+}
+
+/// `object.mesh.addLine` and Create Gradient Mesh `at` a point exactly on the outline add their
+/// lines there with no tolerance, on the bottom and right edges as on the top and left ones.
+#[test]
+fn mesh_add_line_exactly_on_the_edge_needs_no_tolerance() {
+    let mut s = session();
+    let a = rect(&mut s, 0.0, 0.0, 100.0, 100.0);
+    sel(&mut s, &[a]);
+    let r = s.execute("object.mesh.create", &json!({"at": [50, 100]})).unwrap();
+    let m = mesh_of(&s, a);
+    assert_eq!((m.rows, m.cols), (1, 2), "a column through the bottom edge");
+    assert!(m.points[r["index"].as_u64().unwrap() as usize].p.distance(Point::new(50.0, 100.0)) < 0.5);
+    for (x, y) in [(100.0, 30.0), (20.0, 0.0), (0.0, 80.0)] {
+        let r = s.execute("object.mesh.addLine", &json!({"id": a.0, "x": x, "y": y})).unwrap();
+        let p = mesh_of(&s, a).points[r["index"].as_u64().unwrap() as usize].p;
+        assert!(p.distance(Point::new(x, y)) < 0.5, "({x}, {y}): {p:?}");
+    }
+    assert_eq!((mesh_of(&s, a).rows, mesh_of(&s, a).cols), (3, 3));
+    let n = undo_len(&s);
+    assert!(s.execute("object.mesh.addLine", &json!({"id": a.0, "x": 60, "y": 100.01})).is_err(), "just outside");
+    assert_eq!(undo_len(&s), n, "nothing changed");
+}
+
+/// `object.mesh.addLine` at a point that is already a mesh point (a corner, a point on an edge or
+/// inside) adds no line and records no undo step; with a new `color` there it is one step.
+#[test]
+fn mesh_add_line_at_a_mesh_point_records_no_undo_step() {
+    let mut s = session();
+    let a = rect(&mut s, 0.0, 0.0, 100.0, 100.0);
+    sel(&mut s, &[a]);
+    s.execute("object.mesh.create", &json!({"rows": 2, "cols": 2})).unwrap();
+    let (before, n) = (mesh_of(&s, a), undo_len(&s));
+    for (x, y) in [(0.0, 0.0), (100.0, 100.0), (50.0, 100.0), (100.0, 50.0), (50.0, 50.0)] {
+        let r = s.execute("object.mesh.addLine", &json!({"id": a.0, "x": x, "y": y})).unwrap();
+        let p = mesh_of(&s, a).points[r["index"].as_u64().unwrap() as usize].p;
+        assert!(p.distance(Point::new(x, y)) < 0.5, "({x}, {y}): {p:?}");
+        assert_eq!((mesh_of(&s, a), undo_len(&s)), (before.clone(), n), "({x}, {y}): nothing changed");
+    }
+    s.execute("object.mesh.addLine", &json!({"id": a.0, "x": 100, "y": 100, "color": "#00ff00"})).unwrap();
+    assert_eq!(undo_len(&s), n + 1, "a new color is a step");
 }
 
 /// A mesh point `index`, and `rows`, `cols` or `columns` for Create Gradient Mesh, that is not a

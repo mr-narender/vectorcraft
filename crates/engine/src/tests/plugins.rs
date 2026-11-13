@@ -235,8 +235,16 @@ fn live_effect_plugins_reshape_editable_art_and_expand() {
     run(&mut s, "select.all", json!({}));
     run(&mut s, "object.move", json!({"dx": 50, "dy": 0}));
     assert_eq!(effected(&s), *node(&s, a).path_data().unwrap());
+    // A parameter of another type than the manifest gives it is refused.
+    let before = (s.doc().unwrap().doc.clone(), s.doc().unwrap().history.undo.len());
+    let wrong = json!({"ids": [a.0], "effect": "plugin.test.engine.tri", "params": {"size": "4 pt"}});
+    let e = s.execute("effect.apply", &wrong).unwrap_err().to_string();
+    assert!(e.contains("`size` must be a number"), "{e}");
+    assert_eq!((s.doc().unwrap().doc.clone(), s.doc().unwrap().history.undo.len()), before);
     run(&mut s, "effect.apply", json!({"ids": [a.0], "effect": "plugin.test.engine.tri", "params": {"size": 4}}));
     assert_eq!(effected(&s), triangle());
+    let e = s.execute("effect.setParams", &json!({"ids": [a.0], "index": 1, "params": {"size": true}})).unwrap_err().to_string();
+    assert!(e.contains("`size` must be a number"), "{e}");
     assert_eq!(node(&s, a).appearance.effects[1].params, json!({"size": 4}));
     // Uninstalled: the geometry is drawn as it is.
     run(&mut s, "plugin.remove", json!({"id": "test.engine.tri"}));
@@ -327,6 +335,29 @@ fn expanding_a_fill_gives_its_plug_in_effect_the_fill_it_sits_on() {
     let group = s.doc().unwrap().selection.objects[0];
     let clip = node(&s, group).children().unwrap()[0].clone();
     assert_eq!(clip.path_data().unwrap().bounds(), triangle().bounds(), "the triangle the canvas fills");
+}
+
+/// A plug-in effect on a fill, before the fill's own 3D Revolve, is given the fill it sits on
+/// (`_context.item`), so the fill revolves the shape the plug-in returns for it.
+#[test]
+fn a_fills_revolve_gives_the_plug_in_effect_before_it_the_fill_it_sits_on() {
+    let mut s = session();
+    let id = rect(&mut s, 10.0, "#ff0000");
+    let tri = json!({"objects": [{"path": triangle()}]}).to_string();
+    let on_fill = tpl::when_given(&tpl::manifest("test.engine.revolvefill", "effect", "{}"), tpl::Given::Params, r#""item":{"fill":0}"#, &tri);
+    install_wat(&mut s, &on_fill);
+    let fill = node(&s, id).appearance.items.iter().position(|i| i.is_fill()).unwrap();
+    run(&mut s, "effect.apply", json!({"ids": [id.0], "effect": "plugin.test.engine.revolvefill", "item": fill}));
+    run(&mut s, "effect.apply", json!({"ids": [id.0], "effect": "threeD.revolve", "item": fill}));
+    let n = node(&s, id);
+    // The same object with the triangle as its path and only the Revolve on its fill.
+    let mut expected = n.clone();
+    if let vectorcraft_doc::NodeKind::Path { path, .. } = &mut expected.kind {
+        *path = triangle();
+    }
+    expected.appearance.items[fill].effects_mut().retain(|e| e.id == "threeD.revolve");
+    let art = vectorcraft_render::effects::revolve_art(&n).unwrap();
+    assert_eq!(art, vectorcraft_render::effects::revolve_art(&expected).unwrap(), "the fill revolves the triangle");
 }
 
 /// The manifest of a test live effect `id` that declares `paintOutput` (at `api` 2), or that
@@ -452,6 +483,60 @@ fn a_painted_effect_on_a_fill_and_refused_results() {
     }
 }
 
+/// A fill's Drop Shadow before a painted effect that returns two fills, and a 200% Transform effect
+/// after it: the shadow of each returned fill follows the Transform effect. The square the effect
+/// returns spans 30 to 70 pt once scaled, so both half-opaque shadows, 20 pt to the right, cover
+/// 85 pt as they cover 75 pt.
+#[test]
+fn a_shadow_on_each_fill_a_painted_effect_returns_follows_the_transform_after_it() {
+    let mut s = session();
+    let id = rect(&mut s, 10.0, "#ff0000");
+    let out = json!({"objects": [{"path": square_at(40.0), "fills": [solid("#00ff00"), solid("#0000ff")]}]}).to_string();
+    install_wat(&mut s, &tpl::returning(&painting("test.engine.shadowedfills", true), &out));
+    let fill = node(&s, id).appearance.items.iter().position(|i| i.is_fill()).unwrap();
+    for (effect, params) in [
+        ("stylize.dropShadow", json!({"x": 10, "y": 0, "blur": 0, "opacity": 50})),
+        ("plugin.test.engine.shadowedfills", json!({})),
+        ("distort.transform", json!({"scaleH": 200, "scaleV": 200})),
+    ] {
+        run(&mut s, "effect.apply", json!({"ids": [id.0], "effect": effect, "params": params, "item": fill}));
+    }
+    let img = drawn(&s);
+    let (near, far) = (img.pixel(75, 50), img.pixel(85, 50));
+    assert_ne!(near, WHITE, "the shadows reach past the square");
+    assert_eq!(far, near, "both shadows at 20 pt");
+}
+
+/// A Transform effect with Scale Strokes & Effects on after a painted effect on a fill leaves the
+/// Drop Shadow after it as it is on every paint the piece is drawn with.
+#[test]
+fn a_transform_after_a_painted_fill_effect_leaves_the_later_shadow_on_every_paint() {
+    let mut s = session();
+    let id = rect(&mut s, 10.0, "#ff0000");
+    let two = json!({"objects": [{"path": square_at(40.0), "fills": [solid("#00ff00"), solid("#0000ff")]}]}).to_string();
+    install_wat(&mut s, &tpl::returning(&painting("test.engine.twopaints", true), &two));
+    let fill = node(&s, id).appearance.items.iter().position(|i| i.is_fill()).unwrap();
+    run(&mut s, "effect.apply", json!({"ids": [id.0], "effect": "plugin.test.engine.twopaints", "item": fill}));
+    let mut n = node(&s, id);
+    let later = [
+        vectorcraft_doc::Effect { id: "distort.transform".into(), params: json!({"scaleH": 200, "scaleV": 200, "strokes": true}), visible: true },
+        vectorcraft_doc::Effect { id: "stylize.dropShadow".into(), params: json!({"x": 10.0, "y": 0.0, "blur": 0.0}), visible: true },
+    ];
+    n.appearance.items[fill].effects_mut().extend(later);
+    let art = vectorcraft_render::effects::reshape(Some(&s.doc().unwrap().doc), &n, None).unwrap();
+    let mut offsets = vec![];
+    art.walk(&mut |m| {
+        for item in &m.appearance.items {
+            for r in vectorcraft_render::effects::raster_effects(item.effects()) {
+                if let vectorcraft_render::effects::RasterFx::DropShadow { dx, dy, .. } = r {
+                    offsets.push((dx, dy));
+                }
+            }
+        }
+    });
+    assert_eq!(offsets, [(10.0, 0.0), (10.0, 0.0)], "one shadow on each of the piece's two fills");
+}
+
 /// A result refused for a swatch the document doesn't have stays cached: once the document has the
 /// swatch, the next check of that result clears the error.
 #[test]
@@ -503,6 +588,30 @@ fn a_painted_group_effect_links_to_the_document_s_swatches() {
     run(&mut s, "effect.apply", json!({"ids": [g.0], "effect": "plugin.test.engine.grouppaint"}));
     let img = drawn(&s);
     assert_eq!((img.pixel(50, 50), img.pixel(15, 15)), (GREEN, WHITE), "the group's piece, green");
+}
+
+/// A painted effect on a group leaves the group's art as it is when a path in it has a linked
+/// opacity mask, which can't take the pieces as the path does: the mask still covers the path.
+#[test]
+fn a_painted_group_effect_leaves_art_with_a_linked_mask_as_it_is() {
+    let mut s = session();
+    let a = rect(&mut s, 10.0, "#ff0000");
+    let m = rect(&mut s, 10.0, "#ffffff");
+    run(&mut s, "select.set", json!({"ids": [a.0, m.0]}));
+    run(&mut s, "transparency.makeOpacityMask", json!({}));
+    rect(&mut s, 100.0, "#0000ff");
+    run(&mut s, "select.all", json!({}));
+    let g = NodeId(run(&mut s, "object.group", json!({}))["id"].as_u64().unwrap());
+    let out = json!({"objects": [{"path": square_at(40.0), "fills": [solid("#00ff00")]}]}).to_string();
+    install_wat(&mut s, &tpl::returning(&painting("test.engine.maskedpaint", true), &out));
+    run(&mut s, "effect.apply", json!({"ids": [g.0], "effect": "plugin.test.engine.maskedpaint"}));
+    let art = vectorcraft_render::effects::evaluate_container(Some(&s.doc().unwrap().doc), &node(&s, g)).unwrap();
+    let mut masked = vec![];
+    art.walk(&mut |c| masked.extend(c.extras().mask.as_ref().map(|k| (c.geometric_bounds(), k.art.geometric_bounds()))));
+    assert!(!masked.is_empty(), "the masked path");
+    for (path, mask) in masked {
+        assert_eq!(path, mask, "the mask covers the path");
+    }
 }
 
 /// The output of a painted effect that returns one green square linked to swatch `Leaf`.
@@ -641,6 +750,27 @@ fn expanding_a_gradient_fill_keeps_each_piece_s_own_paint() {
         });
         assert_eq!(kept, [Some(own)], "on_fill {on_fill}");
         assert_eq!(plugins, 0, "on_fill {on_fill}: no live effect is left");
+    }
+}
+
+/// `object.expand.info` measures each piece a painted effect returns: a piece whose repeating
+/// gradient needs more runs across it than are written (1,000) reports no gradient to expand, as
+/// Expand leaves it a gradient, and the same gradient in 10 runs reports one.
+#[test]
+fn expand_info_measures_the_gradient_on_each_painted_piece() {
+    for (end, expands) in [(120.0, true), (100.2, false)] {
+        let mut s = session();
+        let id = rect(&mut s, 10.0, "#ff0000");
+        let gradient = json!({"kind": "linear", "spread": "repeat", "repeats": 10, "start": [100, 50], "end": [end, 50]});
+        run(&mut s, "paint.setFill", json!({"ids": [id.0], "gradient": gradient}));
+        let out = json!({"objects": [{"path": square_at(100.0)}]}).to_string();
+        install_wat(&mut s, &tpl::returning(&painting("test.engine.expandruns", true), &out));
+        run(&mut s, "effect.apply", json!({"ids": [id.0], "effect": "plugin.test.engine.expandruns"}));
+        run(&mut s, "select.set", json!({"ids": [id.0]}));
+        let info = s.execute("object.expand.info", &json!({})).unwrap();
+        assert_eq!((info["gradient"].clone(), info["fill"].clone()), (json!(expands), json!(expands)), "{end}");
+        let only_fill = s.execute("object.expand", &json!({"object": false, "fill": true, "stroke": false}));
+        assert_eq!(only_fill.is_ok(), expands, "{end}: {only_fill:?}");
     }
 }
 
@@ -1430,6 +1560,92 @@ fn plugins_folder_set_again_after_clearing_installs_its_plugins() {
     run(&mut s, "prefs.set", json!({"key": "pluginsFolder", "value": ""}));
     run(&mut s, "prefs.set", folder);
     assert!(vectorcraft_plugins::registry::get(id).is_some(), "installed again when the folder is set again");
+    run(&mut s, "plugin.remove", json!({"id": id}));
+}
+
+/// Under automation read roots, `plugin.list` names the plug-in folder last loaded, its failed
+/// files and a plug-in's source file only inside them: a folder outside is `null`, and a file
+/// outside is named by its file name.
+#[test]
+fn plugin_list_leaves_out_paths_outside_the_read_root() {
+    use crate::file_access::{AutomationRoots, confine};
+    let _folder = PREFS_FOLDER.lock().unwrap_or_else(|e| e.into_inner());
+    let base = crate::tests_links::Folder::new("plugin-list-read-root");
+    let (inside, outside) = (base.0.join("in"), base.0.join("out"));
+    std::fs::create_dir_all(&inside).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let id = "test.engine.listroots";
+    let src = tpl::returning(&tpl::manifest(id, "filter", "{}"), r#"{"objects":[]}"#);
+    std::fs::write(outside.join("hidden.wasm"), wat::parse_str(src).unwrap()).unwrap();
+    std::fs::write(outside.join("broken.wasm"), b"\0asm?").unwrap();
+    let folder = outside.to_string_lossy().to_string();
+    let mut s = session();
+    let r = run(&mut s, "plugin.reload", json!({"path": folder}));
+    assert_eq!(r["loaded"], json!([id]), "{r}");
+    let broken = outside.join("broken.wasm").to_string_lossy().to_string();
+    let source = outside.join("hidden.wasm").to_string_lossy().to_string();
+    let entry = |list: &Value| list["plugins"].as_array().unwrap().iter().find(|p| p["id"] == id).cloned().unwrap();
+
+    // The person sees the paths.
+    let person = run(&mut s, "plugin.list", json!({}));
+    assert_eq!((&person["folder"]["folder"], &person["folder"]["failed"][0]["file"]), (&json!(folder), &json!(broken)), "{person}");
+    assert_eq!(entry(&person)["source"], json!(source));
+
+    // The client sees their names.
+    let roots = AutomationRoots::new(&[&inside], &[]).unwrap();
+    let listed = confine(roots.as_ref(), || s.execute("plugin.list", &json!({}))).unwrap();
+    let report = &listed["folder"];
+    assert_eq!((&report["folder"], &report["loaded"], &report["failed"][0]["file"]), (&Value::Null, &json!([id]), &json!("broken.wasm")), "{listed}");
+    assert_eq!(entry(&listed)["source"], "hidden.wasm");
+    let info = confine(roots.as_ref(), || s.execute("plugin.info", &json!({"id": id}))).unwrap();
+    assert_eq!(info["source"], "hidden.wasm");
+    let outside_text = json!(folder).to_string();
+    for reply in [&listed, &info] {
+        assert!(!reply.to_string().contains(outside_text.trim_matches('"')), "no path outside the root: {reply}");
+    }
+
+    // A read root holding the folder shows it whole.
+    let wider = AutomationRoots::new(&[&outside], &[]).unwrap();
+    let listed = confine(wider.as_ref(), || s.execute("plugin.list", &json!({}))).unwrap();
+    assert_eq!(listed["folder"]["folder"], json!(folder), "{listed}");
+    run(&mut s, "plugin.remove", json!({"id": id}));
+}
+
+/// Under automation read roots, a plug-in turned off for the next launch is listed with a file
+/// outside them named by its file name, and `plugin.setEnabled` turns it on by that name.
+#[test]
+fn disabled_plugins_name_files_outside_the_read_root_by_their_names() {
+    if !in_own_process("disabled_plugins_name_files_outside_the_read_root_by_their_names") {
+        return;
+    }
+    use crate::file_access::{AutomationRoots, confine};
+    let base = crate::tests_links::Folder::new("plugin-disabled-read-root");
+    let (inside, outside) = (base.0.join("in"), base.0.join("out"));
+    std::fs::create_dir_all(&inside).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let id = "test.engine.disabledroots";
+    let src = tpl::returning(&tpl::manifest(id, "filter", "{}"), r#"{"objects":[]}"#);
+    let file = outside.join("off.wasm");
+    std::fs::write(&file, wat::parse_str(src).unwrap()).unwrap();
+    let file = file.to_string_lossy().to_string();
+    let mut s = session();
+    run(&mut s, "plugin.install", json!({"path": file}));
+    let roots = AutomationRoots::new(&[&inside], &[]).unwrap();
+    // The client turns it off by the source plugin.list shows.
+    let listed = confine(roots.as_ref(), || s.execute("plugin.list", &json!({}))).unwrap();
+    let source = listed["plugins"].as_array().unwrap().iter().find(|p| p["id"] == id).unwrap()["source"].clone();
+    assert_eq!(source, "off.wasm", "{listed}");
+    confine(roots.as_ref(), || s.execute("plugin.setEnabled", &json!({"file": source, "enabled": false}))).unwrap();
+    assert_eq!(run(&mut s, "plugin.safeMode", json!({}))["disabled"][0]["file"], json!(file), "the person sees the path");
+
+    let outside_text = json!(outside.to_string_lossy()).to_string();
+    for cmd in ["plugin.list", "plugin.safeMode"] {
+        let r = confine(roots.as_ref(), || s.execute(cmd, &json!({}))).unwrap();
+        assert_eq!(r["disabled"][0]["file"], "off.wasm", "{cmd}: {r}");
+        assert!(!r.to_string().contains(outside_text.trim_matches('"')), "{cmd}: no path outside the root: {r}");
+    }
+    let r = confine(roots.as_ref(), || s.execute("plugin.setEnabled", &json!({"file": "off.wasm", "enabled": true}))).unwrap();
+    assert_eq!((&r["changed"], &r["disabled"]), (&json!(true), &json!([])), "{r}");
     run(&mut s, "plugin.remove", json!({"id": id}));
 }
 

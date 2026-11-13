@@ -15,7 +15,11 @@ use crate::{FilePick, Services, VectorcraftApp, dialogs};
 
 mod export;
 mod open;
+mod read_only_save;
 mod save;
+
+#[cfg(test)]
+mod tests_read_only_save;
 
 pub use export::{EXPORT_CANCELLED, cancel_exports, export, export_for_screens, export_pdf, hide_exports, reveal, save_command_output};
 pub(crate) use export::{
@@ -29,6 +33,7 @@ pub use open::{
 };
 #[cfg(test)]
 pub(crate) use open::{open_file, opened_with_notes};
+pub(crate) use save::save_current;
 pub use save::{ask_format_options, ask_pdf_options, remember_active_artboard, remember_view, save, save_pdf};
 pub(crate) use save::{export_path, is_web, notes_of, report_saved, show_with_notes, target_path, write_named, write_reporting, write_to};
 #[cfg(test)]
@@ -152,6 +157,23 @@ mod tests {
         let notes = notes_of(&r);
         assert_eq!(notes.len(), 2, "{r}");
         assert_eq!(app.ui.status, exported_with_notes("/out/c.pdf", notes.len(), &notes[0]));
+        assert_eq!(app.ui.status_notes, Some((app.ui.status.clone(), notes)));
+    }
+
+    /// An export whose encoder notes an option it didn't apply (lossy WebP) before what the file
+    /// loses (type in a font that isn't installed): the status bar names what the file loses, and
+    /// the hover lists it first.
+    #[test]
+    fn an_export_names_what_the_file_loses_before_a_note_on_the_options() {
+        let (mut app, _) = app();
+        app.run("file.new", json!({"width": 100, "height": 100})).unwrap();
+        app.run("text.create", json!({"x": 5, "y": 20, "text": "Ab", "font": "Nonexistent Sans Probe"})).unwrap();
+        let r = export(&mut app, Some("webp"), Some("/out/d.webp".into()), &json!({"lossless": false})).unwrap();
+        let notes = notes_of(&r);
+        assert_eq!(notes.len(), 2, "{r}");
+        assert!(notes[0].contains("Nonexistent Sans Probe"), "{r}");
+        assert!(notes[1].starts_with("lossy WebP"), "{r}");
+        assert_eq!(app.ui.status, exported_with_notes("/out/d.webp", 2, &notes[0]));
         assert_eq!(app.ui.status_notes, Some((app.ui.status.clone(), notes)));
     }
 

@@ -33,7 +33,10 @@
 //! - Type (§15): point type, area type and type on a path as text objects, `type To`, `a b c d tx
 //!   ty startPt Tp` (the text matrix; the frame or path in art space between it and `TP`), each
 //!   run's paint style, `Tr` (fill, stroke, both or neither), `/_font size ascent descent Tf`,
-//!   `Ts Tz Tt TA Tl Ta Ti` and its characters `(…) Tx` (`\r` ends a paragraph), `TO`. Only the
+//!   `Ts Tz Tt TA Tl Ta Ti` and its characters `(…) Tx` (`\r` ends a paragraph), `TO`. Standard
+//!   Vertical Roman Alignment is written as `1 Tv` and `0 Tv`, and Tate-chu-yoko in horizontal
+//!   type as a Kumi block recorded for later use, `1 TY` … `0 TY` (§15.3.4); neither operator is
+//!   written for type that has neither mark. Only the
 //!   revisable form is written: readers lay the type out again (§15.1). Fonts are named by their
 //!   PostScript names in `%%DocumentFonts` and `%%IncludeFont` (§3.1) and re-encoded to
 //!   Windows-1252 (`TE`, then `%AI3_BeginEncoding: _name name`, `TZ`, §3.3), the 8-bit encoding
@@ -110,6 +113,8 @@ const PATTERNS: &str = "pattern fills are written as their tiles, clipped to the
 const FREEFORM: &str = "freeform gradients are written as their average colour";
 const CONIC: &str = "conic gradients are written as solid wedges clipped to the shape (legacy .ai files have no conic gradient)";
 const DIAMOND: &str = "diamond gradients are written as four linear gradients clipped to the shape (legacy .ai files have no diamond gradient)";
+const SPREAD: &str = "gradients that repeat or reflect are written with their stops repeated across the shape (legacy .ai gradients only pad)";
+const SPREAD_CAPPED: &str = "gradients that repeat or reflect are written with at most 256 stops; they pad past those";
 /// Wedges a conic gradient is written as: one a degree.
 const CONIC_WEDGES: usize = 360;
 const STROKES: &str =
@@ -153,6 +158,8 @@ pub enum HiddenObjects {
 pub struct LegacyAiOutput {
     pub bytes: Vec<u8>,
     pub warnings: Vec<String>,
+    /// Notes on what the options asked for: hidden objects left out or written visible.
+    pub setting_notes: Vec<String>,
 }
 
 /// Whether image node `n` of `doc` is written as a 1-bit image mask in its colorize color
@@ -172,7 +179,7 @@ pub fn writes_image_mask(doc: &Document, n: &Node) -> bool {
     matches!(n.extras().colorize.as_deref(), Some(Paint::Solid { .. }))
         && !n.extras().mask.as_ref().is_some_and(|m| !m.disabled)
         && doc
-            .image_blob(im)
+            .image_blob(&doc.shown_image(n, im))
             .is_some_and(|b| b.takes_colorize() && fits(&b.bytes) && b.coverage().is_some_and(|(_, _, c)| c.iter().all(|&v| v == 0 || v == 255)))
 }
 
@@ -264,7 +271,7 @@ pub fn export_legacy_ai(doc: &Document, o: &LegacyAiOptions) -> Result<LegacyAiO
     // The page trailer as the specification's script has it (§3); the document trailer takes the
     // prolog's dictionary off the dictionary stack (its procedure set termination, §3).
     s.push_str("%%PageTrailer\ngsave annotatepage grestore showpage\n%%Trailer\nend\n%%EOF\n");
-    Ok(LegacyAiOutput { bytes: s.into_bytes(), warnings: w.warnings })
+    Ok(LegacyAiOutput { bytes: s.into_bytes(), warnings: w.warnings, setting_notes: w.setting_notes })
 }
 
 #[cfg(test)]
