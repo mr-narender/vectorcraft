@@ -67,6 +67,41 @@ fn png_refuses_a_buffer_of_the_wrong_size() {
     assert!(encode(&[], 0, 0, &PngOptions::default()).is_err());
 }
 
+/// Object › Rasterize's Grayscale and Bitmap images (#6969): a grey PNG of one channel when
+/// opaque and grey and alpha otherwise; Bitmap's black and white as a 1-bit TIFF when opaque,
+/// else as a grey PNG with alpha. Odd widths keep each row on a byte.
+#[test]
+fn gray_and_bilevel_images_store_gray() {
+    let header = |file: &[u8]| (file[24], file[25]);
+    let gray = |file: &[u8]| image::load_from_memory(file).unwrap().to_luma_alpha8().into_raw();
+    // 3 × 2, premultiplied: black, red, light grey; white, mid grey, almost black.
+    let mut img = Rendered {
+        width: 3,
+        height: 2,
+        pixels: [[0, 0, 0], [255, 0, 0], [200; 3], [255; 3], [128; 3], [127; 3]].iter().flat_map(|&[r, g, b]| [r, g, b, 255]).collect(),
+    };
+    let levels: Vec<u8> = [0u8, 54, 200, 255, 128, 127].iter().flat_map(|&g| [g, 255]).collect();
+    let file = img.to_gray_png().unwrap();
+    assert_eq!(header(&file), (8, 0), "8-bit grey");
+    assert_eq!(gray(&file), levels);
+    let (mime, file) = img.to_bilevel(150.0).unwrap();
+    assert_eq!(mime, "image/tiff");
+    let mut d = ::tiff::decoder::Decoder::new(std::io::Cursor::new(&file)).unwrap();
+    assert_eq!(d.colortype().unwrap(), ::tiff::ColorType::Gray(1));
+    let bw: Vec<u8> = [0u8, 0, 255, 255, 255, 0].iter().flat_map(|&g| [g, 255]).collect();
+    assert_eq!(gray(&file), bw, "from 128 up is white");
+    // Half-covered white over the light grey; a clear pixel is white.
+    img.pixels[8..12].copy_from_slice(&[100, 100, 100, 100]);
+    img.pixels[20..24].copy_from_slice(&[0; 4]);
+    let file = img.to_gray_png().unwrap();
+    assert_eq!(header(&file), (8, 4), "grey and alpha");
+    assert_eq!(gray(&file), [0, 255, 54, 255, 255, 100, 255, 255, 128, 255, 255, 0]);
+    let (mime, file) = img.to_bilevel(150.0).unwrap();
+    assert_eq!((mime, header(&file)), ("image/png", (8, 4)), "no 1-bit grey with alpha");
+    assert_eq!(gray(&file), [0, 255, 0, 255, 255, 100, 255, 255, 255, 255, 255, 0], "still black and white");
+    assert!(super::png::encode_gray(&levels[..10], 3, 2, &PngOptions::default()).is_err());
+}
+
 /// A 40×30 pt document with a black circle off the pixel grid.
 fn circle_doc() -> Document {
     let mut d = Document::new(40.0, 30.0);
@@ -226,6 +261,104 @@ fn art_bounds_cover_visible_art_only() {
     assert!((b.x0 - 5.3).abs() < 1e-6 && (b.x1 - 31.1).abs() < 1e-6 && (b.y1 - 26.2).abs() < 1e-6, "{b:?}");
     let empty = Document::new(10.0, 10.0);
     assert_eq!(art_bounds(&empty), None);
+}
+
+#[test]
+fn art_bounds_take_in_the_effects_in_a_symbols_art() {
+    // A symbol's art, (0, 0) to (10, 10), with a drop shadow 8 pt to the right, drawn from (20, 20).
+    let mut d = Document::new(100.0, 100.0);
+    let black = Appearance::basic(Paint::solid(Color::BLACK), Paint::None, 0.0);
+    let mut art = Node::path(d.alloc_id(), shapes::rectangle(Rect::new(0.0, 0.0, 10.0, 10.0)), black);
+    let shadow = vectorcraft_doc::Effect { id: "stylize.dropShadow".into(), params: serde_json::json!({"x": 8, "y": 0, "blur": 0}), visible: true };
+    art.appearance.effects.push(shadow);
+    d.symbols.push(vectorcraft_doc::Symbol { dynamic: false, name: "Box".into(), art: std::sync::Arc::new(art) });
+    let (id, l) = (d.alloc_id(), d.layers[0].id);
+    let xf = vectorcraft_geom::Affine::translate((20.0, 20.0));
+    d.insert(Some(l), 0, Node::new(id, NodeKind::SymbolInstance { symbol: "Box".into(), xf })).unwrap();
+    let b = art_bounds(&d).unwrap();
+    assert!(b.x0 <= 20.0 && b.x1 >= 38.0, "the art from x 20 and its shadow to x 38: {b:?}");
+}
+
+/// A drop shadow 8 pt to the right, without blur.
+fn shadow_right() -> vectorcraft_doc::Effect {
+    vectorcraft_doc::Effect { id: "stylize.dropShadow".into(), params: serde_json::json!({"x": 8, "y": 0, "blur": 0}), visible: true }
+}
+
+#[test]
+fn art_bounds_take_in_the_effects_of_groups_type_and_images() {
+    let black = Appearance::basic(Paint::solid(Color::BLACK), Paint::None, 0.0);
+    let mut d = Document::new(100.0, 100.0);
+    let square = Node::path(d.alloc_id(), shapes::rectangle(Rect::new(10.0, 10.0, 20.0, 20.0)), black);
+    let group = Node::group(d.alloc_id(), vec![std::sync::Arc::new(square)]);
+    let t = TextObject::point(Point::new(10.0, 40.0), "Hill", CharStyle { size: 12.0, ..CharStyle::default() });
+    let text = Node::new(d.alloc_id(), NodeKind::Text(Box::new(t)));
+    let im = vectorcraft_doc::ImageObject {
+        key: "image".into(),
+        width: 30,
+        height: 30,
+        xf: vectorcraft_geom::Affine::translate((20.0, 50.0)),
+        link: None,
+        placement: Default::default(),
+        pixels: None,
+    };
+    let image = Node::new(d.alloc_id(), NodeKind::Image(Box::new(im)));
+    let cut_off: Vec<_> = [("group", group), ("type", text), ("image", image)]
+        .into_iter()
+        .filter_map(|(what, mut n)| {
+            let mut d = d.clone();
+            let plain = n.visual_bounds().unwrap();
+            n.appearance.effects.push(shadow_right());
+            let l = d.layers[0].id;
+            d.insert(Some(l), 0, n).unwrap();
+            let b = art_bounds(&d).unwrap();
+            (b.x0 > plain.x0 || b.x1 < plain.x1 + 8.0).then(|| format!("{what}: {b:?}, the shadow 8 pt right of {plain:?}"))
+        })
+        .collect();
+    assert!(cut_off.is_empty(), "{cut_off:?}");
+}
+
+#[test]
+fn art_bounds_leave_out_the_hidden_members_of_a_group_with_effects() {
+    let black = Appearance::basic(Paint::solid(Color::BLACK), Paint::None, 0.0);
+    let mut d = Document::new(100.0, 100.0);
+    let square = Node::path(d.alloc_id(), shapes::rectangle(Rect::new(10.0, 10.0, 20.0, 20.0)), black.clone());
+    let mut hidden = Node::path(d.alloc_id(), shapes::rectangle(Rect::new(200.0, 10.0, 220.0, 20.0)), black.clone());
+    hidden.visible = false;
+    let mut guide = Node::path(d.alloc_id(), shapes::rectangle(Rect::new(-300.0, 10.0, -200.0, 20.0)), black);
+    if let NodeKind::Path { guide: g, .. } = &mut guide.kind {
+        *g = true;
+    }
+    let mut group = Node::group(d.alloc_id(), [square, hidden, guide].map(std::sync::Arc::new).to_vec());
+    // A geometry effect on the group's own fill that is turned off.
+    group.appearance = Appearance::basic(Paint::None, Paint::None, 0.0).into();
+    group.appearance.effects.push(shadow_right());
+    let off = vectorcraft_doc::Effect { id: "distort.transform".into(), params: serde_json::json!({"scaleH": 50}), visible: false };
+    group.appearance.fill_mut().unwrap().effects.push(off);
+    let l = d.layers[0].id;
+    d.insert(Some(l), 0, group).unwrap();
+    let b = art_bounds(&d).unwrap();
+    assert!(b.x0 >= 0.0 && (28.0..50.0).contains(&b.x1), "the square and its shadow, not the hidden square or the guide: {b:?}");
+}
+
+#[test]
+fn art_bounds_hold_a_groups_geometry_effect_measured_with_its_hidden_members() {
+    // The Transform effect halves the group's width about the center of all its members, the
+    // hidden one too: the visible rectangle is drawn from x 30 to x 80.
+    let black = Appearance::basic(Paint::solid(Color::BLACK), Paint::None, 0.0);
+    let mut d = Document::new(200.0, 100.0);
+    let shown = Node::path(d.alloc_id(), shapes::rectangle(Rect::new(0.0, 10.0, 100.0, 20.0)), black.clone());
+    let mut hidden = Node::path(d.alloc_id(), shapes::rectangle(Rect::new(110.0, 10.0, 120.0, 20.0)), black);
+    hidden.visible = false;
+    let mut group = Node::group(d.alloc_id(), [shown, hidden].map(std::sync::Arc::new).to_vec());
+    let half = serde_json::json!({"scaleH": 50, "scaleV": 100});
+    group.appearance.effects.push(vectorcraft_doc::Effect { id: "distort.transform".into(), params: half, visible: true });
+    let l = d.layers[0].id;
+    d.insert(Some(l), 0, group).unwrap();
+    let b = art_bounds(&d).unwrap();
+    assert!(b.x0 <= 30.0 && b.x1 >= 80.0, "{b:?}");
+    let img = Renderer::new().render_region(&d, Rect::new(0.0, 0.0, 200.0, 100.0), 1.0, false);
+    let drawn = |x: u32| (0..100).any(|y| img.pixels[((y * 200 + x) * 4 + 3) as usize] > 0);
+    assert!(drawn(31) && drawn(78) && !drawn(28) && !drawn(82), "the rectangle is drawn from x 30 to x 80");
 }
 
 /// A black path round `r` in the first layer of `d`, made a guide when `guide`.
