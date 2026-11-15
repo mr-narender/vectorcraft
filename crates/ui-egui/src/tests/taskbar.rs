@@ -1,7 +1,8 @@
 //! The Contextual Task Bar's actions for each kind of selection: open paths offer Join and Edit
 //! Path, compound paths and clipping masks their Release, images selected with vector art Make
 //! Clipping Mask, type converts between point and area type, type on a path opens its options, and
-//! a basic shape shows its properties in place of Lock. Type, and the Type tools while they edit it,
+//! a basic shape shows its properties in place of Lock. The basic shape tools show Edit Path, Fill,
+//! Stroke and Shape Properties for the shape they draw. Type, and the Type tools while they edit it,
 //! show the font family, font style and Font Size controls.
 
 use egui::{Event, PointerButton, Pos2, Rect, vec2};
@@ -53,6 +54,42 @@ fn click(app: &mut VectorcraftApp, label: &str) {
     frame(app, &ctx, vec![press(false)]);
     frame(app, &ctx, vec![]);
 }
+
+/// The names and places of the buttons the task bar draws, from the accessibility tree: an
+/// icon-only button is named by its hover text.
+fn buttons(app: &mut VectorcraftApp) -> (egui::Context, Vec<(String, Rect)>) {
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    crate::theme::install_fonts(&ctx);
+    frame(app, &ctx, vec![]);
+    let screen = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 700.0));
+    let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| canvas::show(app, ui));
+    out.textures_delta.clear();
+    let nodes = &out.platform_output.accesskit_update.as_ref().expect("an accessibility tree").nodes;
+    let named = nodes
+        .iter()
+        .filter(|(_, n)| n.role() == egui::accesskit::Role::Button)
+        .filter_map(|(_, n)| {
+            let b = n.bounds()?;
+            Some((n.label()?.to_string(), Rect::from_min_max(Pos2::new(b.x0 as f32, b.y0 as f32), Pos2::new(b.x1 as f32, b.y1 as f32))))
+        })
+        .collect();
+    (ctx, named)
+}
+
+/// Click the task bar's button named `name` (its label, or an icon-only button's hover text).
+fn click_button(app: &mut VectorcraftApp, name: &str) {
+    let (ctx, named) = buttons(app);
+    let p = named.iter().find(|(n, _)| n == name).unwrap_or_else(|| panic!("no button named {name:?} in {named:?}")).1.center();
+    let press = |pressed| Event::PointerButton { pos: p, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+    frame(app, &ctx, vec![Event::PointerMoved(p)]);
+    frame(app, &ctx, vec![press(true)]);
+    frame(app, &ctx, vec![press(false)]);
+    frame(app, &ctx, vec![]);
+}
+
+const TO_CORNER: &str = "Convert Selected Anchor Points to Corner";
+const TO_SMOOTH: &str = "Convert Selected Anchor Points to Smooth";
 
 fn select(app: &mut VectorcraftApp, ids: &[u64]) {
     app.run("select.set", json!({"ids": ids})).unwrap();
@@ -278,7 +315,7 @@ fn point_type_offers_dynamic_text() {
 /// The path's anchors (its first subpath).
 fn anchors(app: &VectorcraftApp, id: u64) -> Vec<vectorcraft_geom::Anchor> {
     match kind(app, id) {
-        NodeKind::Path { path, .. } => path.subpaths[0].anchors.clone(),
+        NodeKind::Path { path, .. } => path.subpaths[0].anchors.to_vec(),
         k => panic!("not a path: {k:?}"),
     }
 }
@@ -293,27 +330,67 @@ fn direct_selection_of_a_whole_path_offers_its_anchor_actions() {
     click(&mut app, "Edit Path");
     assert_eq!(app.session.tool_id(), "directSelection");
     assert!(app.session.active().unwrap().selection.anchors.is_empty(), "the path is selected whole");
+    let (_, named) = buttons(&mut app);
+    let names: Vec<&str> = named.iter().map(|(n, _)| n.as_str()).collect();
+    for name in ["Connect", TO_CORNER, TO_SMOOTH, "Simplify", "Smooth", "Duplicate"] {
+        assert!(names.contains(&name), "{name}: {names:?}");
+    }
+    for name in ["Edit Path", "Offset Path", "Join", "Remove Anchor Points", "Cut Path"] {
+        assert!(!names.contains(&name), "{name}: {names:?}");
+    }
+    // The convert buttons show their icons alone: the bar draws no convert text, and one "Smooth".
     let (_, texts) = bar(&mut app);
-    for label in ["Connect", "Corner", "Smooth", "Simplify", "Duplicate"] {
-        assert!(has(&texts, label), "{label}: {texts:?}");
-    }
-    for label in ["Edit Path", "Offset Path", "Join", "Remove Anchor Points", "Cut Path"] {
-        assert!(!has(&texts, label), "{label}: {texts:?}");
-    }
-    // Smooth and Corner convert every anchor of the path, one undo step each.
-    click(&mut app, "Smooth");
+    assert!(!has(&texts, "Corner") && !texts.iter().any(|(t, _)| t.starts_with("Convert")), "{texts:?}");
+    assert_eq!(texts.iter().filter(|(t, _)| t == "Smooth").count(), 1, "{texts:?}");
+    // The convert buttons convert every anchor of the path, one undo step each.
+    click_button(&mut app, TO_SMOOTH);
     let a = anchors(&app, line);
     assert_eq!(a[1].kind, vectorcraft_geom::AnchorKind::Smooth, "{a:?}");
     assert!(a[1].has_in() && a[1].has_out(), "{a:?}");
-    click(&mut app, "Corner");
+    click_button(&mut app, TO_CORNER);
     assert!(anchors(&app, line).iter().all(|a| !a.has_in() && !a.has_out()), "{:?}", anchors(&app, line));
     app.run("edit.undo", json!({})).unwrap();
     assert!(anchors(&app, line)[1].has_in(), "Corner undoes in one step");
     // Connect closes the open path; a closed one isn't offered it.
     click(&mut app, "Connect");
     assert!(matches!(kind(&app, line), NodeKind::Path { path, .. } if path.is_closed()));
-    let (_, texts) = bar(&mut app);
-    assert!(!has(&texts, "Connect") && has(&texts, "Corner"), "{texts:?}");
+    let (_, named) = buttons(&mut app);
+    assert!(!named.iter().any(|(n, _)| n == "Connect") && named.iter().any(|(n, _)| n == TO_CORNER), "{named:?}");
+}
+
+/// With the Direct Selection tool, the bar's Smooth smooths the path's curvature: it opens the
+/// Smooth slider, as Object › Path › Smooth… does, and changes nothing until the slider is
+/// confirmed (#6784). Simplify opens its slider in the same way.
+#[test]
+fn direct_selection_smooth_opens_the_smooth_slider() {
+    for (name, kind) in [("Smooth", crate::dialogs::smooth_slider::KIND), ("Simplify", crate::dialogs::simplify_slider::KIND)] {
+        let mut app = app();
+        // A jagged line of 40 anchor points, which Smooth changes at its opening level.
+        let anchors_in: Vec<_> = (0..40).map(|i| json!({"x": 50 + i * 5, "y": 150 + (i % 2) * 6})).collect();
+        let line = id(app.run("path.create", json!({"anchors": anchors_in})).unwrap());
+        app.run("tool.select", json!({"tool": "directSelection"})).unwrap();
+        select(&mut app, &[line]);
+        let before = anchors(&app, line);
+        let undo = app.session.active().unwrap().history.undo.len();
+        click_button(&mut app, name);
+        let d = app.ui.dialog.as_ref().unwrap_or_else(|| panic!("{name} opens its slider: {}", app.ui.status));
+        assert_eq!(d.kind, kind, "{name}");
+        assert_eq!(app.session.active().unwrap().history.undo.len(), undo, "{name} adds no undo step before it is confirmed");
+        crate::dialogs::cancel(&mut app);
+        assert_eq!(anchors(&app, line), before, "{name}: canceling leaves the path as it was");
+        if name != "Smooth" {
+            continue;
+        }
+        // Confirmed, the slider smooths the path as one undo step, which is not the anchor convert.
+        click_button(&mut app, name);
+        crate::dialogs::confirm(&mut app).unwrap();
+        let history = &app.session.active().unwrap().history.undo;
+        assert_eq!(history.len(), undo + 1, "one undo step");
+        assert_ne!(history.last().unwrap().label, "Convert Anchor Points");
+        assert_ne!(anchors(&app, line), before, "Smooth changes the path's curvature");
+        app.run("edit.undo", json!({})).unwrap();
+        assert_eq!(anchors(&app, line), before, "undo restores the path");
+    }
 }
 
 /// Anchors picked out with the Direct Selection tool keep the full set: Remove and Cut need them.
@@ -323,11 +400,12 @@ fn direct_selected_anchors_still_offer_remove_and_cut() {
     let line = id(app.run("path.create", json!({"anchors": [{"x": 50, "y": 200}, {"x": 150, "y": 80}, {"x": 250, "y": 200}]})).unwrap());
     app.run("tool.select", json!({"tool": "directSelection"})).unwrap();
     app.run("select.anchors", json!({"id": line, "anchors": [[0, 1]]})).unwrap();
-    let (_, texts) = bar(&mut app);
-    for label in ["Remove Anchor Points", "Connect", "Cut Path", "Corner", "Smooth"] {
-        assert!(has(&texts, label), "{label}: {texts:?}");
+    let (_, named) = buttons(&mut app);
+    let names: Vec<&str> = named.iter().map(|(n, _)| n.as_str()).collect();
+    for name in ["Remove Anchor Points", "Connect", "Cut Path", TO_CORNER, TO_SMOOTH] {
+        assert!(names.contains(&name), "{name}: {names:?}");
     }
-    assert!(!has(&texts, "Edit Path"), "{texts:?}");
+    assert!(!names.contains(&"Edit Path"), "{names:?}");
 }
 
 /// Click the task bar's button left of More Options (Lock, or a basic shape's Shape Properties),
@@ -492,6 +570,155 @@ fn other_selections_keep_lock() {
         assert!(locked(&app, shape), "{tool} keeps Lock");
         app.run("object.unlockAll", json!({})).unwrap();
     }
+}
+
+/// The basic shape tools: the tool ids, and the Shape Properties heading each tool's shape shows
+/// (none for the star, a plain path).
+const SHAPE_TOOLS: [(&str, Option<&str>); 5] = [
+    ("rectangle", Some("Rectangle Properties:")),
+    ("roundedRectangle", Some("Rectangle Properties:")),
+    ("ellipse", Some("Ellipse Properties:")),
+    ("polygon", Some("Polygon Properties:")),
+    ("star", None),
+];
+
+/// Draw with `tool` by dragging across the canvas from the document point `from` to `to`, and return
+/// whether the task bar showed partway through the drag.
+fn drag_with(app: &mut VectorcraftApp, tool: &str, from: (f64, f64), to: (f64, f64)) -> bool {
+    app.run("tool.select", json!({ "tool": tool })).unwrap();
+    let ctx = egui::Context::default();
+    crate::theme::install_fonts(&ctx);
+    frame(app, &ctx, vec![]);
+    frame(app, &ctx, vec![]);
+    let xf = canvas::Xf::new(app.canvas_rect.unwrap(), app.view().unwrap());
+    let (a, b) = (xf.to_screen(vectorcraft_geom::Point::new(from.0, from.1)), xf.to_screen(vectorcraft_geom::Point::new(to.0, to.1)));
+    let press = |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+    frame(app, &ctx, vec![Event::PointerMoved(a), press(a, true)]);
+    frame(app, &ctx, vec![Event::PointerMoved(a + (b - a) / 2.0)]);
+    frame(app, &ctx, vec![Event::PointerMoved(b)]);
+    let shown_mid_drag = canvas::task_bar_rect(&ctx).is_some();
+    frame(app, &ctx, vec![press(b, false)]);
+    frame(app, &ctx, vec![]);
+    shown_mid_drag
+}
+
+fn names(named: &[(String, Rect)]) -> Vec<&str> {
+    named.iter().map(|(n, _)| n.as_str()).collect()
+}
+
+/// Each basic shape tool, just after it draws a shape, shows Edit Path, Fill and Stroke for it, and
+/// Shape Properties for a live rectangle, rounded rectangle, ellipse or polygon. The bar leaves out
+/// the selection tools' Duplicate, Offset Path, Simplify, Recolor Artwork and Lock, and shows
+/// nothing during the drag that draws the shape.
+#[test]
+fn shape_tools_show_edit_path_paint_and_properties_after_drawing() {
+    let mut app = app();
+    for (i, (tool, heading)) in SHAPE_TOOLS.into_iter().enumerate() {
+        let x = 30.0 + 70.0 * i as f64;
+        let shown_mid_drag = drag_with(&mut app, tool, (x, 60.0), (x + 50.0, 120.0));
+        assert!(!shown_mid_drag, "{tool}: no bar while the shape is dragged out");
+        assert_eq!(app.session.tool_id(), tool);
+        let st = app.session.active().unwrap();
+        assert_eq!(st.selection.objects.len(), 1, "{tool} drew and selected a shape");
+        let shape = st.selection.objects[0].0;
+        let (_, named) = buttons(&mut app);
+        let names = names(&named);
+        for name in ["Edit Path", "Fill", "Stroke", "More Options"] {
+            assert!(names.contains(&name), "{tool}: {name} in {names:?}");
+        }
+        assert_eq!(names.contains(&"Shape Properties"), heading.is_some(), "{tool}: {names:?}");
+        for name in ["Duplicate", "Offset Path", "Simplify", "Recolor Artwork", "Lock (⌘2)"] {
+            assert!(!names.contains(&name), "{tool}: {name} is left out of {names:?}");
+        }
+        if let Some(heading) = heading {
+            let (_, texts) = click_lock_slot(&mut app);
+            assert!(has(&texts, heading), "{tool}: {heading} in {texts:?}");
+            assert!(!locked(&app, shape), "{tool}: the button doesn't lock the shape");
+        }
+    }
+}
+
+/// With a basic shape tool in use, the bar shows only for one closed path selected whole: not with
+/// nothing selected, several objects, a group, an open path, type or picked-out anchors. The Line
+/// Segment tool shows no bar for a selected rectangle.
+#[test]
+fn shape_tools_have_no_shape_bar_without_a_single_shape() {
+    let mut app = app();
+    let a = id(app.run("shape.rectangle", json!({"x": 20, "y": 20, "width": 30, "height": 30})).unwrap());
+    let b = id(app.run("shape.ellipse", json!({"x": 60, "y": 20, "width": 30, "height": 30})).unwrap());
+    let c = id(app.run("shape.rectangle", json!({"x": 20, "y": 250, "width": 30, "height": 30})).unwrap());
+    let d = id(app.run("shape.rectangle", json!({"x": 60, "y": 250, "width": 30, "height": 30})).unwrap());
+    select(&mut app, &[c, d]);
+    let group = id(app.run("object.group", json!({})).unwrap());
+    let line = id(app.run("shape.line", json!({"x1": 150, "y1": 50, "x2": 300, "y2": 120})).unwrap());
+    let text = id(app.run("text.create", json!({"x": 150, "y": 200, "text": "Type"})).unwrap());
+    let cases: [(&str, Vec<u64>); 5] =
+        [("nothing", vec![]), ("several", vec![a, b]), ("a group", vec![group]), ("an open path", vec![line]), ("type", vec![text])];
+    for (tool, _) in SHAPE_TOOLS {
+        app.run("tool.select", json!({ "tool": tool })).unwrap();
+        for (what, ids) in &cases {
+            select(&mut app, ids);
+            let (ctx, _) = bar(&mut app);
+            assert!(canvas::task_bar_rect(&ctx).is_none(), "{tool} with {what}: no bar");
+        }
+        app.run("select.anchors", json!({"id": a, "anchors": [[0, 1]]})).unwrap();
+        let (ctx, _) = bar(&mut app);
+        assert!(canvas::task_bar_rect(&ctx).is_none(), "{tool} with anchors: no bar");
+        select(&mut app, &[a]);
+        let (ctx, _) = bar(&mut app);
+        assert!(canvas::task_bar_rect(&ctx).is_some(), "{tool} with the rectangle: the bar");
+    }
+    app.run("tool.select", json!({"tool": "lineSegment"})).unwrap();
+    select(&mut app, &[a]);
+    let (ctx, _) = bar(&mut app);
+    assert!(canvas::task_bar_rect(&ctx).is_none(), "the Line Segment tool: no bar");
+}
+
+/// A basic shape tool's bar follows the selection: Shape Properties shows the shape drawn last,
+/// edits it with Undo restoring it, and after an Undo of the drawing shows the shape selected
+/// then. Fill makes the Fill active, Stroke the Stroke, and Edit Path switches to the Direct
+/// Selection tool.
+#[test]
+fn shape_tool_bar_retargets_after_another_shape_and_undo() {
+    let mut app = app();
+    app.run("tool.select", json!({"tool": "ellipse"})).unwrap();
+    let rect = id(app.run("shape.rectangle", json!({"x": 40, "y": 40, "width": 80, "height": 60, "radius": 10})).unwrap());
+    let (ctx, texts) = click_lock_slot(&mut app);
+    assert!(has(&texts, "Rectangle Properties:"), "{texts:?}");
+    type_into(&mut app, &ctx, &texts, "10 pt", "20");
+    let corners = |app: &VectorcraftApp| match live(app, rect) {
+        vectorcraft_doc::LiveShape::Rectangle { radii, .. } => radii,
+        l => panic!("{l:?}"),
+    };
+    assert_eq!(corners(&app), [20.0; 4]);
+    app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(corners(&app), [10.0; 4]);
+
+    let ellipse = id(app.run("shape.ellipse", json!({"x": 200, "y": 40, "width": 80, "height": 60})).unwrap());
+    let (_, texts) = click_lock_slot(&mut app);
+    assert!(has(&texts, "Ellipse Properties:") && !has(&texts, "Rectangle Properties:"), "{texts:?}");
+    app.run("edit.undo", json!({})).unwrap();
+    assert!(app.session.active().unwrap().doc.node(NodeId(ellipse)).is_none(), "the ellipse is undone");
+    let selected: Vec<u64> = app.session.active().unwrap().selection.objects.iter().map(|i| i.0).collect();
+    let (ctx, texts) = bar(&mut app);
+    assert!(!has(&texts, "Ellipse Properties:"), "{texts:?}");
+    if selected == [rect] {
+        assert!(canvas::task_bar_rect(&ctx).is_some(), "the rectangle selected again: the bar");
+    } else {
+        assert!(canvas::task_bar_rect(&ctx).is_none(), "{selected:?}: no bar");
+        select(&mut app, &[rect]);
+    }
+    let (_, texts) = click_lock_slot(&mut app);
+    assert!(has(&texts, "Rectangle Properties:"), "{texts:?}");
+
+    app.session.fill_active = false;
+    click_button(&mut app, "Fill");
+    assert!(app.session.fill_active, "Fill makes the Fill active");
+    click_button(&mut app, "Stroke");
+    assert!(!app.session.fill_active, "Stroke makes the Stroke active");
+    assert_eq!(app.session.tool_id(), "ellipse");
+    click_button(&mut app, "Edit Path");
+    assert_eq!(app.session.tool_id(), "directSelection");
 }
 
 /// A compound path under the Direct Selection tool isn't offered Edit Path, which would only switch

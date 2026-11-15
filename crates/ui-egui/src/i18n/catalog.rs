@@ -13,7 +13,8 @@ pub struct Catalog {
     ids: HashMap<String, String>,
     /// plural messages: `one|other` → forms
     plurals: HashMap<String, Vec<String>>,
-    /// status and error messages without placeholders (`@msg`): English → translation
+    /// status and error messages without placeholders (`@msg`): English, its `{{` and `}}` read as
+    /// `{` and `}` → translation, as written
     messages: HashMap<String, String>,
     /// status and error messages with `{name}` placeholders (`@msg`, and each English form of a
     /// `@msgplural` row), most specific first
@@ -193,13 +194,20 @@ impl Catalog {
                 "@plural" => {
                     c.plurals.insert(src, tr.split('|').map(str::to_string).collect());
                 }
-                "@msg" => {
-                    if src.contains('{') || src.contains("}}") {
-                        c.templates.extend(Template::parse(&src, vec![tr], false));
-                    } else {
-                        c.messages.insert(src, tr);
-                    }
+                "@msg" if !src.contains(['{', '}']) => {
+                    c.messages.insert(src, tr);
                 }
+                "@msg" => match Template::parse(&src, vec![tr], false) {
+                    // A row without placeholders is an exact message, under its text with `{{` and
+                    // `}}` read as literal braces.
+                    Some(Template { pieces, mut forms, .. }) if matches!(pieces.as_slice(), [Piece::Text(_)]) => {
+                        if let (Some(Piece::Text(text)), Some(tr)) = (pieces.into_iter().next(), forms.pop()) {
+                            c.messages.insert(text, tr);
+                        }
+                    }
+                    Some(template) => c.templates.push(template),
+                    None => {}
+                },
                 "@msgplural" => {
                     let forms: Vec<String> = tr.split('|').map(str::to_string).collect();
                     c.templates.extend(src.split('|').filter_map(|english| Template::parse(english, forms.clone(), true)));
@@ -211,8 +219,13 @@ impl Catalog {
         }
         // Templates that start with text before those that start with a placeholder, so
         // `plug-in manifest: {0}` wins over `{_1} is {_2} bytes (limit {_3})` for a message it
-        // wraps; then most literal text first, so `Couldn't open {name}: {e}` wins over `{path}: {e}`.
-        c.templates.sort_by_key(|t| (matches!(t.pieces.first(), Some(Piece::Hole(_))), std::cmp::Reverse(t.literal)));
+        // wraps; then the longest text before the first placeholder, so `` `answers[{i}]` {e} `` wins
+        // over `` `{key}` must be true or false `` for a message it wraps; then most literal text
+        // first, so `Couldn't open {name}: {e}` wins over `{path}: {e}`.
+        c.templates.sort_by_key(|t| {
+            let lead = if let Some(Piece::Text(text)) = t.pieces.first() { text.len() } else { 0 };
+            (matches!(t.pieces.first(), Some(Piece::Hole(_))), std::cmp::Reverse(lead), std::cmp::Reverse(t.literal))
+        });
         c
     }
 
@@ -249,8 +262,8 @@ impl Catalog {
         self.templates.iter().find_map(|t| t.captures(s).map(|caps| (t.forms.as_slice(), caps)))
     }
 
-    /// The translation of a status or error message that has an exact `@msg` entry; templates are
-    /// not tried.
+    /// The translation of a status or error message that has an exact `@msg` entry, as written in
+    /// the catalog (`{{` and `}}` for literal braces); templates are not tried.
     pub fn exact_message(&self, s: &str) -> Option<&str> {
         self.messages.get(s).map(String::as_str)
     }
