@@ -26,6 +26,9 @@ pub struct PrintJob<'a> {
     /// The job's name in the print queue.
     pub title: &'a str,
     pub pdf: &'a [u8],
+    /// Send the PDF to the printer's own PDF interpreter over its RAW TCP port instead of
+    /// spooling it through the platform driver (Windows).
+    pub direct_pdf: bool,
 }
 
 /// Submission callable from the desktop background worker.
@@ -41,6 +44,12 @@ pub trait PrintService {
     /// on the UI thread to invoke their print dialog.
     fn shared_print(&self) -> Option<SharedPrintFn> {
         None
+    }
+    /// Whether the system turns a landscape page to fit the paper. macOS's print queues put
+    /// each page on the paper as it is, so their jobs are written upright (`file.print`'s
+    /// `forPrinter`); Windows and the browser's print dialog turn them themselves.
+    fn turns_landscape(&self) -> bool {
+        true
     }
     /// Whether Setup… can open the system's printer settings.
     fn has_setup(&self) -> bool {
@@ -58,9 +67,10 @@ pub fn printers(app: &mut VectorcraftApp) -> Value {
     json!({ "printers": printers, "service": app.services.print.is_some(), "setup": setup })
 }
 
-/// `file.print` with settings: print the active document with `settings` (over the document's)
-/// on `printer` (default: the system's default), or save the job as a PDF at `path` (else a picked
-/// file, the web downloads it) with `toFile`, a `path` or no print service. A PostScript file
+/// `file.print` with settings: print the active document with `settings` (over the document's, or
+/// over those of the print preset `preset` names) on `printer` (default: the system's default), or
+/// save the job as a PDF at `path` (else a picked file, the web downloads it) with `toFile`, a
+/// `path` or no print service. A PostScript file
 /// (`format: "postscript"` or a `.ps` path, at `level`, flattened with `flattenerPreset`) is saved
 /// the same way.
 pub fn run(app: &mut VectorcraftApp, p: &Value) -> Result<Value, String> {
@@ -68,7 +78,7 @@ pub fn run(app: &mut VectorcraftApp, p: &Value) -> Result<Value, String> {
     let postscript = s("format").as_deref() == Some("postscript") || s("path").is_some_and(|path| fileio::extension(&path) == "ps");
     let to_file = p.get("toFile").and_then(Value::as_bool).unwrap_or(false) || s("path").is_some() || postscript;
     let mut q = json!({});
-    for k in ["settings", "format", "level", "flattenerPreset"] {
+    for k in ["preset", "settings", "format", "level", "flattenerPreset"] {
         if let Some(v) = p.get(k).filter(|v| !v.is_null()) {
             q[k] = v.clone();
         }
@@ -90,11 +100,15 @@ pub fn run(app: &mut VectorcraftApp, p: &Value) -> Result<Value, String> {
         v["printed"] = json!(false);
         return Ok(v);
     }
+    if app.services.print.as_ref().is_some_and(|s| !s.turns_landscape()) {
+        q["forPrinter"] = json!(true);
+    }
     let mut v = app.session.execute("file.print", &q).map_err(|e| e.to_string())?;
     let data = v.as_object_mut().and_then(|o| o.remove("dataBase64"));
     let pdf = data.as_ref().and_then(Value::as_str).and_then(vectorcraft_format::base64_decode).ok_or("the print job has no data")?;
     let title = app.session.active().map(|d| d.title()).unwrap_or_default();
     let printer = s("printer").filter(|n| !n.is_empty());
+    let direct_pdf = p.get("directPdf").and_then(Value::as_bool).unwrap_or(false);
     let service = app.services.print.as_mut().ok_or("no print service")?;
     if let Some(submit) = service.shared_print() {
         let pending_printer = printer.clone();
@@ -104,7 +118,8 @@ pub fn run(app: &mut VectorcraftApp, p: &Value) -> Result<Value, String> {
             format!("Printing {title}"),
             None,
             move |_| {
-                submit(&PrintJob { printer: printer.as_deref(), title: &title, pdf: &pdf }).map(|note| json!({ "note": note, "printer": printer }))
+                submit(&PrintJob { printer: printer.as_deref(), title: &title, pdf: &pdf, direct_pdf })
+                    .map(|note| json!({ "note": note, "printer": printer }))
             },
             move |app, result| {
                 let receipt = result?;
@@ -125,7 +140,7 @@ pub fn run(app: &mut VectorcraftApp, p: &Value) -> Result<Value, String> {
         }
         return Ok(v);
     }
-    let done = service.print(&PrintJob { printer: printer.as_deref(), title: &title, pdf: &pdf })?;
+    let done = service.print(&PrintJob { printer: printer.as_deref(), title: &title, pdf: &pdf, direct_pdf })?;
     app.status(done);
     v["printer"] = json!(printer);
     v["printed"] = json!(true);
