@@ -1,6 +1,6 @@
 //! Pattern Options panel: active in pattern editing mode (Object → Pattern → Make / Edit
-//! Pattern). Name, Tile Type, Brick Offset, Width/Height, Size Tile to Art with H/V spacing,
-//! Overlap, Copies, Dim Copies, Show Tile Edge, Show Swatch Bounds; Save a Copy / Done / Cancel. Outside editing
+//! Pattern). Name, Tile Type, Brick Offset, Width/Height, Size Tile to Art with H/V spacing, Move
+//! Tile with Art, Overlap, Copies, Dim Copies, Show Tile Edge, Show Swatch Bounds; Save a Copy / Done / Cancel. Outside editing
 //! mode it lists the document's patterns with an Edit button.
 
 use egui::Ui;
@@ -43,16 +43,17 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
         return;
     };
     let name = def.name.clone();
-    // Name (commit on Enter / focus loss).
+    // Name (commit on Enter / focus loss; Shift+Enter commits and keeps the focus).
     row(ui, tl!("Name:"), |ui| {
-        let id = ui.id().with("po-name");
+        let id = ui.scope_id().with("po-name");
         let mut buf: String = ui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or_else(|| name.clone());
         if !ui.memory(|m| m.has_focus(id)) {
             buf = name.clone();
         }
-        let r = ui.add(egui::TextEdit::singleline(&mut buf).id(id).desired_width(150.0));
+        let kept = widgets::own_field_shift_enter(ui, id, &mut buf, &name);
+        let r = ui.add(egui::TextEdit::singleline(&mut buf).id(id).align(egui::Align2::LEFT_CENTER).desired_width(150.0));
         ui.data_mut(|d| d.insert_temp(id, buf.clone()));
-        if r.lost_focus() && !buf.trim().is_empty() && buf != name {
+        if (r.lost_focus() || kept) && !buf.trim().is_empty() && buf != name {
             set(app, &name, json!({"newName": buf.trim()}));
         }
     });
@@ -92,6 +93,9 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     });
     if widgets::check(ui, tl!("Size Tile to Art"), sized, true) {
         set(app, &name, json!({"sizeTileToArt": !sized}));
+    }
+    if widgets::check(ui, tl!("Move Tile with Art"), def.move_tile_with_art, true) {
+        set(app, &name, json!({"moveTileWithArt": !def.move_tile_with_art}));
     }
     row(ui, tl!("H Spacing:"), |ui| {
         ui.add_enabled_ui(sized, |ui| {
@@ -231,6 +235,36 @@ mod tests {
         v
     }
 
+    /// Shift+Enter in the Name field renames the pattern and keeps the field active, the new name
+    /// selected; Enter then renames it again and ends the editing.
+    #[test]
+    fn shift_enter_in_the_name_field_renames_the_pattern_and_keeps_the_focus() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 200, "height": 200})).unwrap();
+        app.run("shape.rectangle", json!({"x": 0, "y": 0, "width": 10, "height": 10})).unwrap();
+        app.run("object.pattern.make", json!({"name": "Dots"})).unwrap();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let named = |app: &VectorcraftApp, name: &str| app.session.active().unwrap().doc.pattern(name).is_some();
+        let key = |key, modifiers| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+        let texts = frame(&mut app, &ctx, vec![]);
+        let at = texts.iter().find(|(t, _)| t == "Dots").expect("the Name field").1.center();
+        let click = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(at), click(true)]);
+        frame(&mut app, &ctx, vec![click(false)]);
+        frame(&mut app, &ctx, vec![key(egui::Key::A, egui::Modifiers::COMMAND), egui::Event::Text("Stripes".into())]);
+        frame(&mut app, &ctx, vec![key(egui::Key::Enter, egui::Modifiers::SHIFT)]);
+        assert!(named(&app, "Stripes"), "Shift+Enter applies the name");
+        let field = ctx.memory(|m| m.focused()).expect("the field keeps the focus");
+        frame(&mut app, &ctx, vec![]);
+        let selected = egui::TextEdit::load_state(&ctx, field).and_then(|st| st.cursor.char_range()).map(|r| r.as_sorted_char_range());
+        assert_eq!(selected.map(|r| (r.start.0, r.end.0)), Some((0, 7)), "the name shown is selected");
+        frame(&mut app, &ctx, vec![egui::Event::Text("Waves".into())]);
+        frame(&mut app, &ctx, vec![key(egui::Key::Enter, egui::Modifiers::NONE)]);
+        assert!(named(&app, "Waves"), "typing replaced it, and Enter applies that");
+        assert!(ctx.memory(|m| m.focused()).is_none(), "Enter ends the editing");
+    }
+
     #[test]
     fn show_swatch_bounds_toggles_the_pattern_option() {
         let mut app = VectorcraftApp::new(Session::new(), Default::default());
@@ -245,5 +279,30 @@ mod tests {
         frame(&mut app, &ctx, vec![egui::Event::PointerMoved(at), click(true)]);
         frame(&mut app, &ctx, vec![click(false)]);
         assert!(app.session.active().unwrap().doc.pattern("Dots").unwrap().show_swatch_bounds);
+    }
+
+    /// The Move Tile with Art checkbox sits under Size Tile to Art and turns the option on and off.
+    #[test]
+    fn move_tile_with_art_toggles_the_pattern_option() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 200, "height": 200})).unwrap();
+        app.run("shape.rectangle", json!({"x": 0, "y": 0, "width": 10, "height": 10})).unwrap();
+        app.run("object.pattern.make", json!({"name": "Dots"})).unwrap();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let on = |app: &VectorcraftApp| app.session.active().unwrap().doc.pattern("Dots").unwrap().move_tile_with_art;
+        let texts = frame(&mut app, &ctx, vec![]);
+        let find = |t: &str| texts.iter().find(|(s, _)| s == t).map(|(_, r)| *r);
+        let (sized, at) = (find("Size Tile to Art").expect("Size Tile to Art"), find("Move Tile with Art").expect("the checkbox"));
+        assert!(at.top() > sized.top(), "under Size Tile to Art");
+        let at = at.center();
+        let click = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        assert!(!on(&app));
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(at), click(true)]);
+        frame(&mut app, &ctx, vec![click(false)]);
+        assert!(on(&app));
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(at), click(true)]);
+        frame(&mut app, &ctx, vec![click(false)]);
+        assert!(!on(&app));
     }
 }

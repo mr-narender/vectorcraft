@@ -19,12 +19,12 @@ mod width;
 
 use std::borrow::Cow;
 
-use kurbo::{BezPath, ParamCurve, ParamCurveNearest, PathEl, PathSeg, Shape};
+use kurbo::{BezPath, ParamCurve, ParamCurveNearest, PathEl, PathSeg, Rect, Shape};
 use vectorcraft_doc::{LineCap, LineJoin, StrokeAlign, StrokeLayer};
 pub(crate) use vectorcraft_geom::bez::{kink, segments, subpaths, tangent, unit};
 
 pub use arrow::Arrow;
-pub use dash::{Dashed, Dot, dash, dot_outline};
+pub use dash::{Dashed, Dot, dash, dash_kept, dot_outline};
 pub use gradient::{Slice, WrittenSlices, gradient_meshes, gradient_slices, written_slices};
 pub use outline::{OUTLINE_TOL, Written, WrittenShape, for_writer, is_plain, outline_region};
 pub use width::width_outline;
@@ -111,13 +111,66 @@ pub fn line_outline(line: &BezPath, st: &StrokeLayer, width: f64, tol: f64) -> B
             }
             out
         }
-        (None, Some(d)) => {
-            let mut out = kurbo::stroke(d.path.iter(), &style(st, width), &kurbo::StrokeOpts::default(), tol);
-            out.extend(dot_outline(&d.dots, width, st.cap, tol).iter());
+        (None, Some(d)) => dashed_outline(&d, st, width, tol),
+        (None, None) => {
+            let mut out = plain_outline(line, &style(st, width), tol);
+            out.extend(dot_outline(&point_dots(line), width, st.cap, tol).iter());
             out
         }
-        (None, None) => plain_outline(line, &style(st, width), tol),
     }
+}
+
+/// The variable-width outline near `near`, with its profile positions measured on the whole
+/// undashed line. Returns `None` when no segment is omitted or the stroke is dashed.
+pub fn line_outline_profile_near(line: &BezPath, st: &StrokeLayer, width: f64, tol: f64, near: Rect) -> Option<BezPath> {
+    if st.dash.is_some() || line.elements().is_empty() || width <= 0.0 || !width.is_finite() {
+        return None;
+    }
+    width::width_outline_near(line, width, st.profile.as_ref()?, st, tol, near)
+}
+
+/// [`line_outline`] of a dashed line without a width profile, made of only the dashes and dots on
+/// the segments of `line` that `keep` accepts ([`dash_kept`]). `None` when `st` has no dash
+/// pattern or has a width profile, or when its pattern draws the line solid.
+pub fn dashed_line_outline_kept(line: &BezPath, st: &StrokeLayer, width: f64, tol: f64, keep: &dyn Fn(&PathSeg) -> bool) -> Option<BezPath> {
+    if st.profile.is_some() {
+        return None;
+    }
+    let d = dash_kept(line, st.dash.as_ref()?, keep)?;
+    if width <= 0.0 || !width.is_finite() {
+        return Some(BezPath::new());
+    }
+    Some(dashed_outline(&d, st, width, tol.max(1e-4)))
+}
+
+/// The filled outline of the dashes and dots `d` of a stroke `st` without a width profile, at
+/// `width` and flattened/fitted to `tol`.
+fn dashed_outline(d: &Dashed, st: &StrokeLayer, width: f64, tol: f64) -> BezPath {
+    let mut out = kurbo::stroke(d.path.iter(), &style(st, width), &kurbo::StrokeOpts::default(), tol);
+    out.extend(dot_outline(&d.dots, width, st.cap, tol).iter());
+    out
+}
+
+/// The subpaths of `line` that never leave their first point (`m` then `L` to the same point, as
+/// `.ai` files write dots, #1613), as dots: kurbo strokes nothing for them, where PDF and SVG
+/// viewers paint the cap. They lie along the x axis, which a projecting cap's square follows
+/// (SVG 2, "Path data": zero-length path segments).
+fn point_dots(line: &BezPath) -> Vec<Dot> {
+    let els = line.elements();
+    subpaths(line)
+        .into_iter()
+        .filter_map(|(r, _)| {
+            let sub = els.get(r)?;
+            let at = sub.first()?.end_point()?;
+            let still = sub.iter().all(|e| match e {
+                PathEl::MoveTo(p) | PathEl::LineTo(p) => *p == at,
+                PathEl::QuadTo(a, b) => *a == at && *b == at,
+                PathEl::CurveTo(a, b, c) => *a == at && *b == at && *c == at,
+                PathEl::ClosePath => true,
+            });
+            still.then_some(Dot { at, dir: kurbo::Vec2::new(1.0, 0.0), t: 0.0 })
+        })
+        .collect()
 }
 
 /// `line` stroked with `style`, to fill with the non-zero rule.
