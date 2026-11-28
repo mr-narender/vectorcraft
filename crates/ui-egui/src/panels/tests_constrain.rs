@@ -1,14 +1,14 @@
 //! The W/H link (Constrain Width and Height Proportions) in the Transform panel, the Properties
 //! panel's Transform section and the Control bar: one preference, passed on as `proportional`.
+//! Alt+Enter in their fields applies the value to a copy of the selection, passed on as `copy`, and
+//! Ctrl/Cmd+Enter in W or H keeps the proportions whether the link is on or off.
 
-use egui::{Event, Key, Modifiers, PointerButton};
+use egui::Modifiers;
 use serde_json::json;
 
-use super::tests_appearance::{frame_raw, run};
+use super::tests_appearance::run;
 use super::*;
-
-/// What draws a set of size fields.
-type Draw = fn(&mut VectorcraftApp, &mut Ui);
+use crate::tests::panel_harness::Panel;
 
 /// A selected 100 × 50 pt rectangle.
 fn rect_app() -> VectorcraftApp {
@@ -25,50 +25,65 @@ fn size(app: &VectorcraftApp) -> (f64, f64) {
     (b.width().round(), b.height().round())
 }
 
-/// Type `value` into the W field (the one showing "100 pt") of what `draw` shows, and press Enter.
-fn set_width(app: &mut VectorcraftApp, draw: Draw, value: &str) {
-    let ctx = egui::Context::default();
-    crate::theme::install_fonts(&ctx);
-    let mut time = 0.0;
-    let mut frame = |app: &mut VectorcraftApp, events: Vec<Event>| {
-        time += 1.0;
-        frame_raw(&ctx, app, egui::RawInput { events, time: Some(time), ..Default::default() }, draw)
-    };
-    let shown = frame(app, vec![]);
-    let at = shown.iter().find(|(s, _)| s == "100 pt").unwrap_or_else(|| panic!("no W field in {shown:?}")).1.center();
-    let button = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
-    frame(app, vec![Event::PointerMoved(at), button(true), button(false)]);
-    // Focus selected the whole field: typing replaces it.
-    frame(app, vec![]);
-    frame(app, vec![Event::Text(value.into())]);
-    let enter = Event::Key { key: Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE };
-    frame(app, vec![enter]);
+/// The paths of the document, bottom to top: their size and angle (rounded), and whether each is
+/// selected.
+fn paths(app: &VectorcraftApp) -> Vec<((f64, f64), f64, bool)> {
+    let st = app.session.active().unwrap();
+    let mut out = vec![];
+    st.doc.walk(|n| {
+        if matches!(n.kind, vectorcraft_doc::NodeKind::Path { .. }) {
+            let b = st.doc.oriented_bounds(&[n.id], false).unwrap();
+            out.push(((b.rect.width().round(), b.rect.height().round()), b.angle.round(), st.selection.objects.contains(&n.id)));
+        }
+    });
+    out
 }
 
+/// One Enter with modifiers in a field: Alt makes a copy unless anchors are selected (they move),
+/// and Ctrl/Cmd scales proportionally in W and H only.
 #[test]
-fn the_link_keeps_proportions_in_every_size_field() {
-    let surfaces: [(&str, Draw); 3] =
-        [("Transform panel", transform::show), ("Properties", properties::transform_section), ("Control bar", crate::chrome::control_bar)];
-    for (name, draw) in surfaces {
-        // Off: W alone.
+fn enter_modifiers_set_copy_and_proportional() {
+    // (case, field, typed, modifiers, anchors selected, a copy is made, selection size, angle of the last path)
+    let rows = [
+        ("Alt+Enter on W", "Width", "200", Modifiers::ALT, false, true, Some((200.0, 50.0)), 0.0),
+        ("Alt+Enter on X", "X position", "150", Modifiers::ALT, false, true, Some((100.0, 50.0)), 0.0),
+        ("Alt+Enter on Rotate", "Rotate", "45", Modifiers::ALT, false, true, None, 45.0),
+        ("Alt+Enter on X, anchors", "X position", "150", Modifiers::ALT, true, false, Some((140.0, 50.0)), 0.0),
+        ("Cmd+Enter on W", "Width", "200", Modifiers::COMMAND, false, false, Some((200.0, 100.0)), 0.0),
+        ("Cmd+Enter on X", "X position", "200", Modifiers::COMMAND, false, false, Some((100.0, 50.0)), 0.0),
+    ];
+    for (case, field, text, mods, anchors, copy, want_size, angle) in rows {
         let mut app = rect_app();
-        set_width(&mut app, draw, "200");
-        assert_eq!(size(&app), (200.0, 50.0), "{name}, unlinked");
-        // On: H follows.
-        let mut app = rect_app();
-        run(&mut app, "prefs.set", json!({"key": "constrainProportions", "value": true}));
-        set_width(&mut app, draw, "200");
-        assert_eq!(size(&app), (200.0, 100.0), "{name}, linked");
+        if anchors {
+            let id = app.session.active().unwrap().selection.objects[0].0;
+            run(&mut app, "select.anchors", json!({"id": id, "anchors": [[0, 1]]}));
+        }
+        let undo = app.session.doc().unwrap().history.undo.len();
+        let mut p = Panel::new(app, transform::show);
+        p.type_into_with(field, text, mods);
+        let app = p.app();
+        let all = paths(&app);
+        assert_eq!(all.len(), 1 + usize::from(copy), "{case}: copy");
+        if let Some(s) = want_size {
+            assert_eq!(size(&app), s, "{case}: size");
+        }
+        assert_eq!(all.last().map(|a| a.1), Some(angle), "{case}: angle");
+        assert_eq!(app.session.doc().unwrap().history.undo.len(), undo + 1, "{case}: one undo step");
+        if copy {
+            assert_eq!(all.last().map(|a| a.2), Some(true), "{case}: the copy is selected");
+        }
     }
-}
-
-#[test]
-fn the_link_is_a_preference_agents_can_read_and_set() {
-    let mut app = rect_app();
-    assert_eq!(run(&mut app, "prefs.get", json!({"key": "constrainProportions"})), json!(false));
-    run(&mut app, "prefs.set", json!({"key": "constrainProportions", "value": true}));
-    assert!(app.session.prefs.constrain_proportions);
-    // What the fields send with the link on.
-    run(&mut app, "object.setBounds", json!({"height": 100, "reference": 4, "proportional": true}));
-    assert_eq!(size(&app), (200.0, 100.0));
+    // The Artboard tool's W: Cmd+Enter keeps the artboard's proportions.
+    let board = |mods| {
+        let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+        run(&mut app, "file.new", json!({"width": 200, "height": 150}));
+        app.run("tool.select", json!({"tool": "artboard"})).unwrap();
+        // With the Artboard tool the panel shows the artboard's fields.
+        let mut p = Panel::new(app, transform::show);
+        p.type_into_with("Width", "400", mods);
+        let r = p.app().session.active().unwrap().doc.artboards[0].rect;
+        (r.width().round(), r.height().round())
+    };
+    assert_eq!(board(Modifiers::NONE), (400.0, 150.0));
+    assert_eq!(board(Modifiers::COMMAND), (400.0, 300.0));
 }

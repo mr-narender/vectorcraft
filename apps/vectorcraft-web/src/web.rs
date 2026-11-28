@@ -5,6 +5,12 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+use craft::host::target::ShellInfo;
+use craft::host::{AppInfo, InlineJobs};
+use craft::platform::browser_files::BrowserFiles;
+use craft::ui::InstallSpec;
+use craft::ui::shell::embed;
+use craft::window::system::SystemWindows;
 use vectorcraft_engine::Session;
 use vectorcraft_engine::cmd::clipboard::{FILE_HEAD, Flavour, PASTE_ORDER, file_flavour, is_address};
 use vectorcraft_engine::cmd::fileio;
@@ -17,8 +23,19 @@ use vectorcraft_ui_egui::{Services, VectorcraftApp};
 use wasm_bindgen::JsCast as _;
 
 use crate::locks::WebLocks;
+use crate::pencil::SharedPointers;
 
-type Inbox = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+pub(crate) type Inbox = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+/// The files waiting to open, by where they came from (`Services::inbox` and `page_inbox`). The
+/// browser's file chooser answers through the host's file service ([`BrowserFiles`]), not here.
+#[derive(Clone, Default)]
+struct OpenInboxes {
+    /// Dropped on the page.
+    dropped: Inbox,
+    /// Handed over by the page's script (`window.vectorcraft.openFile`).
+    page: Inbox,
+}
 
 /// Where the pointer was over the canvas during the last file drag (CSS px from its top-left) and
 /// whether Shift was held: where dropped files land.
@@ -43,10 +60,15 @@ const MAX_RESTARTS: u32 = 3;
 #[derive(Clone)]
 struct Host {
     runner: eframe::WebRunner,
-    inbox: Inbox,
+    inbox: OpenInboxes,
     place_inbox: PlaceInbox,
     drag: DragPos,
     pasted: Rc<RefCell<Pasted>>,
+    /// Pen and finger input read from the page's Pointer Events (`crate::pencil`).
+    pointers: SharedPointers,
+    /// The running app's context, for the page's key listener (`crate::keys`), which is installed
+    /// before the first frame; every start after lost graphics fills it again.
+    ctx: crate::keys::ContextSlot,
     /// The page's Web Locks for Data Recovery, started once before the first frame: a graphics
     /// restart keeps them, so the tab stays the owner of its recovery area.
     locks: Option<WebLocks>,
@@ -69,14 +91,17 @@ pub fn start() {
         crate::fonts::load_startup_fonts().await;
         let host = Host {
             runner: eframe::WebRunner::new(),
-            inbox: Arc::default(),
+            inbox: OpenInboxes::default(),
             place_inbox: Arc::default(),
             drag: DragPos::default(),
             pasted: Rc::default(),
+            pointers: SharedPointers::default(),
+            ctx: crate::keys::ContextSlot::default(),
             locks,
             restarts: 0,
         };
         track_paste(&host.pasted);
+        crate::keys::keep_app_keys(host.ctx.clone());
         run(host, canvas, None).await;
     });
 }
@@ -96,6 +121,7 @@ async fn run(host: Host, canvas: web_sys::HtmlCanvasElement, moving: Option<Movi
     // The app until the new runner takes it (still here if starting fails before).
     let slot = Rc::new(RefCell::new(moving.map(|m| m.app)));
     let (runner, taken, page) = (host.runner.clone(), slot.clone(), canvas.clone());
+    let (pointers, pen_canvas) = (host.pointers.clone(), canvas.clone());
     let result = runner
         .start(
             canvas,
@@ -111,22 +137,54 @@ async fn run(host: Host, canvas: web_sys::HtmlCanvasElement, moving: Option<Movi
                     rs.device.set_device_lost_callback(move |reason, msg| loss.report(&ctx, format!("{reason:?}: {msg}")));
                 }
                 host.pasted.borrow_mut().ctx = Some(ctx.clone());
-                let services = services(host.inbox.clone(), host.place_inbox.clone(), ctx.clone(), host.locks.clone());
-                let app = match taken.borrow_mut().take() {
+                *host.ctx.borrow_mut() = Some(ctx.clone());
+                // PLAN: assumed `SharedPointers::pen(&self) -> PenSource` (shell-w13's `pencil.rs`), in place of `stylus()`.
+                let pen = host.pointers.borrow().pen();
+                let spec = InstallSpec::new(ShellInfo::current(), Arc::new(SystemWindows)).pen(pen);
+                // The interface faces the page serves are fetched by the stack as text needs them.
+                let fonts = vectorcraft_ui_egui::ui_fonts().fetcher(Arc::new(crate::fonts::BrowserFetcher));
+                embed::install(ctx, spec, &fonts).map_err(|e| e.to_string())?;
+                egui_extras::install_image_loaders(ctx);
+                let files = {
+                    let ctx = ctx.clone();
+                    BrowserFiles::new(move || ctx.request_repaint())
+                };
+                // The web saves no preferences: the host keeps its default in-memory sections.
+                craft::host::Host::builder(AppInfo { id: "vectorcraft", name: "VectorCraft", version: env!("CARGO_PKG_VERSION") })
+                    // PLAN: assumed `vectorcraft_ui_egui::i18n::shared() -> Arc<I18n>`
+                    .i18n(i18n::shared())
+                    .jobs(Arc::new(InlineJobs))
+                    .files(Arc::new(files))
+                    .install(ctx);
+                let services = services(host.inbox.clone(), host.place_inbox.clone(), host.locks.clone(), ctx.clone());
+                let mut app = match taken.borrow_mut().take() {
                     Some(mut app) => {
                         // The old services asked the old context for frames.
                         app.services = services;
                         app.status("The graphics were lost and have been restarted");
+                        crate::api::connect(None, host.inbox.page.clone(), ctx.clone());
                         app
                     }
-                    None => VectorcraftApp::new(Session::new(), services),
+                    None => {
+                        // `window.vectorcraft`: the page's control channel (crate::api).
+                        let (control_tx, control_rx) = std::sync::mpsc::channel();
+                        crate::api::connect(Some(control_tx), host.inbox.page.clone(), ctx.clone());
+                        if let Err(e) = crate::api::install() {
+                            log::error!("vectorcraft-web: couldn't install window.vectorcraft: {}", js_err(e));
+                        }
+                        VectorcraftApp::new(Session::new(), services).with_control(control_rx)
+                    }
                 };
+                app.adopt_context(ctx);
                 Ok(Box::new(WebShell { app: Some(app), host, canvas: page, loss }))
             }),
         )
         .await;
     match (result, kept) {
         (Ok(()), _) => {
+            if let Err(e) = crate::pencil::install(&runner, &pen_canvas, &pointers) {
+                log::error!("vectorcraft-web: no pen input: {}", js_err(e));
+            }
             if let Some(el) = element(LOADING_ID) {
                 el.remove();
             }
@@ -310,7 +368,7 @@ fn notice(lines: &[&str]) {
 
 /// Wraps the app to read dropped files asynchronously (browsers can't read them synchronously)
 /// and feed them through the inboxes: placed where they were dropped on the canvas, else opened
-/// (libraries, presets and plug-ins open wherever they are dropped).
+/// (libraries, presets, plug-ins and shortcut sets open wherever they are dropped).
 /// When the graphics are lost it hands the app to a new runner on a new canvas.
 struct WebShell {
     /// `None` once handed on.
@@ -348,98 +406,71 @@ impl eframe::App for WebShell {
             self.restart(&why);
         }
         let Some(app) = &mut self.app else { return };
-        let pasted = self.host.pasted.borrow_mut().flavour.take();
-        if let Some((f, held)) = pasted {
-            app.paste_from_host(ctx, f, held);
-        }
-        let dropped = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
-        if !dropped.is_empty() {
-            let at = self.host.drag.take();
-            let z = ctx.zoom_factor();
-            let (pos, shift) = (at.map(|(x, y, _)| egui::pos2(x / z, y / z)), at.is_some_and(|a| a.2));
-            for f in dropped {
-                let name = f.path().file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "dropped".into());
-                let target = app.drop_target(&name, pos, shift);
-                let (inbox, place_inbox, ctx) = (self.host.inbox.clone(), self.host.place_inbox.clone(), ctx.clone());
-                wasm_bindgen_futures::spawn_local(async move {
-                    match f.bytes_async().await {
-                        Ok(bytes) => {
-                            match target {
-                                DropTarget::Place(d) => {
-                                    place_inbox.lock().unwrap_or_else(|e| e.into_inner()).push(PlaceArrival { name, bytes, drop: Some(d) })
-                                }
-                                DropTarget::Open => inbox.lock().unwrap_or_else(|e| e.into_inner()).push((name, bytes)),
-                            }
-                            ctx.request_repaint();
-                        }
-                        Err(e) => log::error!("couldn't read dropped file {name}: {e}"),
-                    }
-                });
-            }
-        }
-        app.logic(ctx);
+        app.tick(ctx);
+        embed::logic(ctx, || app.close_decision());
     }
 
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+    /// Forward host-gathered pointer events into this frame's raw input, then let the app apply its
+    /// shared input hook before egui runs.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        raw.events.extend(self.host.pointers.borrow_mut().take());
         if let Some(app) = &mut self.app {
-            app.raw_input_hook(raw);
+            app.raw_input(ctx, raw);
+            embed::before_input(ctx, |out| app.frame_input(out));
         }
     }
 
+    /// Read host paste and drop input once in the UI phase, hand files to the app's drop targets, run
+    /// the app UI, then poll control replies.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         if let Some(app) = &mut self.app {
+            // DOM paste and drop are host input: read them in the UI phase, once per pass, not in
+            // `logic` where a hidden tab replays the last shown frame's input.
+            let pasted = self.host.pasted.borrow_mut().flavour.take();
+            if let Some((f, held)) = pasted {
+                app.paste_from_host(&ctx, f, held);
+            }
+            let dropped = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
+            if !dropped.is_empty() {
+                let at = self.host.drag.take();
+                let z = ctx.zoom_factor();
+                let (pos, shift) = (at.map(|(x, y, _)| egui::pos2(x / z, y / z)), at.is_some_and(|a| a.2));
+                for f in dropped {
+                    let name = f.path().file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "dropped".into());
+                    let target = app.drop_target(&name, app.drop_spot(pos), shift);
+                    let (inbox, place_inbox, repaint) = (self.host.inbox.dropped.clone(), self.host.place_inbox.clone(), ctx.clone());
+                    wasm_bindgen_futures::spawn_local(async move {
+                        match f.bytes_async().await {
+                            Ok(bytes) => {
+                                match target {
+                                    DropTarget::Place(d) => {
+                                        place_inbox.lock().unwrap_or_else(|e| e.into_inner()).push(PlaceArrival { name, bytes, drop: d })
+                                    }
+                                    DropTarget::Open => inbox.lock().unwrap_or_else(|e| e.into_inner()).push((name, bytes)),
+                                }
+                                repaint.request_repaint();
+                            }
+                            Err(e) => log::error!("couldn't read dropped file {name}: {e}"),
+                        }
+                    });
+                }
+            }
             app.ui(ui);
         }
     }
 }
 
-fn services(inbox: Inbox, place_inbox: PlaceInbox, ctx: egui::Context, locks: Option<WebLocks>) -> Services {
-    let open_inbox = inbox.clone();
-    let picked = place_inbox.clone();
-    let place_ctx = ctx.clone();
+fn services(inbox: OpenInboxes, place_inbox: PlaceInbox, locks: Option<WebLocks>, ctx: egui::Context) -> Services {
     Services {
-        // File → Place…: the picked files go to the Place dialog.
-        place_async: Some(Box::new(move || {
-            let inbox = picked.clone();
-            let ctx = place_ctx.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                let dialog =
-                    fileio::place_filters().fold(rfd::AsyncFileDialog::new().set_title(vectorcraft_ui_egui::i18n::t("Place")), |d, (name, exts)| {
-                        d.add_filter(vectorcraft_ui_egui::i18n::tr_ctx(vectorcraft_ui_egui::i18n::current(), "file-filter", name), exts)
-                    });
-                let Some(files) = dialog.pick_files().await else {
-                    return;
-                };
-                let mut arrived = vec![];
-                for f in files {
-                    arrived.push(PlaceArrival { name: f.file_name(), bytes: f.read().await, drop: None });
-                }
-                inbox.lock().unwrap_or_else(|e| e.into_inner()).extend(arrived);
-                ctx.request_repaint();
-            });
-        })),
+        // Plug-ins are checked and filters run in workers of their own, off the page.
+        plugin_workers: vectorcraft_ui_egui::plugin_runs::workers(Box::new(crate::plugin_workers::PageWorkers { ctx })),
+        // A download that couldn't be started fails the save or export it is for (#1693).
+        download: Some(Box::new(|name: &str, bytes: &[u8]| download(name, bytes).inspect_err(|e| log::error!("download of {name} failed: {e}")))),
+        inbox: Some(inbox.dropped),
+        page_inbox: Some(inbox.page),
+        // Files dropped on the canvas to place.
         place_inbox: Some(place_inbox),
-        open_async: Some(Box::new(move || {
-            let inbox = open_inbox.clone();
-            let ctx = ctx.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                let dialog = fileio::open_filters().fold(rfd::AsyncFileDialog::new(), |d, (name, exts)| {
-                    d.add_filter(vectorcraft_ui_egui::i18n::tr_ctx(vectorcraft_ui_egui::i18n::current(), "file-filter", name), exts)
-                });
-                let Some(file) = dialog.pick_file().await else {
-                    return;
-                };
-                let bytes = file.read().await;
-                inbox.lock().unwrap_or_else(|e| e.into_inner()).push((file.file_name(), bytes));
-                ctx.request_repaint();
-            });
-        })),
-        download: Some(Box::new(|name: &str, bytes: &[u8]| {
-            if let Err(e) = download(name, bytes) {
-                log::error!("download of {name} failed: {e}");
-            }
-        })),
-        inbox: Some(inbox),
         recovery_store: Some(Arc::new(BrowserStore { locks })),
         // File → Print: the browser's print dialog.
         print: Some(Box::new(BrowserPrint)),
@@ -500,6 +531,9 @@ impl RecoveryStore for BrowserStore {
 
 /// Trigger a browser download of `bytes` named after the last component of `path`.
 fn download(path: &str, bytes: &[u8]) -> Result<(), String> {
+    if crate::api::capture(path, bytes) {
+        return Ok(());
+    }
     let js = |e: wasm_bindgen::JsValue| format!("{e:?}");
     let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "vectorcraft".into());
     let window = web_sys::window().ok_or("no window")?;
@@ -517,7 +551,8 @@ fn download(path: &str, bytes: &[u8]) -> Result<(), String> {
     let revoke = wasm_bindgen::closure::Closure::once_into_js(move || {
         web_sys::Url::revoke_object_url(&url).ok();
     });
-    window.set_timeout_with_callback_and_timeout_and_arguments_0(revoke.unchecked_ref(), 10_000).map_err(js)?;
+    // The download has started: a timer that can't be set leaves the URL allocated, no more.
+    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(revoke.unchecked_ref(), 10_000);
     Ok(())
 }
 

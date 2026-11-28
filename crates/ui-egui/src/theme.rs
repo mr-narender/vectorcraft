@@ -1,9 +1,10 @@
-//! Design tokens (Illustrator's four UI brightness levels), fonts and egui style.
+//! The user's interface choices (brightness, accent, colour scheme) and how they select the root theme.
 
-use std::sync::Arc;
-
-use egui::{Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle, Visuals};
+use craft::theme::{AppSizes, ModeChoice, Rgba, ThemeId};
+use egui::{FontFamily, FontId};
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, LazyLock};
+use vectorcraft_engine::Prefs;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Brightness {
@@ -37,317 +38,201 @@ impl Brightness {
     }
 }
 
-/// All colours and metrics the UI uses. Never hard-code a colour in a widget.
-#[derive(Clone, Copy, Debug)]
-pub struct Tokens {
-    pub dark: bool,
-    pub app_bar: Color32,
-    pub panel: Color32,
-    pub panel_darker: Color32,
-    pub input: Color32,
-    pub input_border: Color32,
-    pub border: Color32,
-    pub divider: Color32,
-    pub text: Color32,
-    pub text_dim: Color32,
-    pub text_disabled: Color32,
-    pub icon: Color32,
-    pub hover: Color32,
-    pub tool_active: Color32,
-    pub accent: Color32,
-    pub accent_strong: Color32,
-    pub row_selected: Color32,
-    pub pasteboard: Color32,
-    pub ruler: Color32,
-    pub ruler_tick: Color32,
-    pub smart_guide: Color32,
-    pub guide: Color32,
-    pub measure_bg: Color32,
-    pub button: Color32,
-    pub radius: u8,
-    /// Field values, button labels, link labels.
-    pub text_strong: Color32,
-    /// Panel tab strips, doc-tab bar, dock header.
-    pub tab_strip: Color32,
-    /// Outline of secondary (outlined) buttons.
-    pub button_border: Color32,
-    /// Default Layer 1 selection colour and selected-anchor fill.
-    pub selection: Color32,
-    pub anchor_selected: Color32,
-    /// Active item text in tool flyouts.
-    pub flyout_active: Color32,
-    /// Hint-bar / tab-bar heights etc. scale with this base font size.
-    pub font_size: f32,
-    /// Window Close button (custom title bar) when hovered, and its glyph there.
-    pub caption_close: Color32,
-    pub caption_close_text: Color32,
-    /// What preview images mark (Flattener Preview highlights).
-    pub highlight: Color32,
-    /// The bleed outline around artboards (Document Setup → Bleed).
-    pub bleed: Color32,
-    /// Error marks (a missing linked file).
-    pub error: Color32,
-    /// Warning marks (a modified linked file).
-    pub warning: Color32,
-    /// Rotation gizmo axes, also labelled X, Y and Z.
-    pub axis_x: Color32,
-    pub axis_y: Color32,
-    pub axis_z: Color32,
+/// User Interface › Accent Color: the one colour for what is on, chosen or focused. Coral, the
+/// default, is the app icon's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Accent {
+    #[default]
+    Coral,
+    Blue,
+    Violet,
+    Green,
+    Amber,
+    Pink,
 }
 
-impl Tokens {
-    pub fn for_brightness(b: Brightness) -> Self {
-        let hex = |s: u32| Color32::from_rgb((s >> 16) as u8, (s >> 8) as u8, s as u8);
-        let base = Tokens {
-            dark: true,
-            app_bar: hex(0x262626),
-            panel: hex(0x323232),
-            panel_darker: hex(0x282828),
-            input: hex(0x1f1f1f),
-            input_border: hex(0x464646),
-            border: hex(0x1b1b1b),
-            divider: hex(0x3f3f3f),
-            text: hex(0xd8d8d8),
-            text_dim: hex(0xa8a8a8),
-            text_disabled: hex(0x6e6e6e),
-            icon: hex(0xcfcfcf),
-            hover: hex(0x444444),
-            tool_active: hex(0x1d1d1d),
-            accent: hex(0x378ef0),
-            accent_strong: hex(0x1473e6),
-            row_selected: hex(0x484b50),
-            pasteboard: hex(0x1e1e1e),
-            ruler: hex(0x2f2f2f),
-            ruler_tick: hex(0x8a8a8a),
-            smart_guide: hex(0xff3dfc),
-            guide: hex(0x4affff),
-            measure_bg: Color32::from_rgba_unmultiplied(92, 92, 92, 235),
-            button: hex(0x444444),
-            radius: 2,
-            text_strong: hex(0xf5f5f5),
-            tab_strip: hex(0x282828),
-            button_border: hex(0x6a6a6a),
-            selection: hex(0x4f80ff),
-            anchor_selected: hex(0x3d82ff),
-            flyout_active: hex(0x54b2f7),
-            font_size: 13.0,
-            caption_close: hex(0xc42b1c),
-            caption_close_text: Color32::WHITE,
-            highlight: hex(0xff3030),
-            bleed: hex(0xf03030),
-            error: hex(0xe34850),
-            warning: hex(0xf0a330),
-            axis_x: hex(0xef6058),
-            axis_y: hex(0x45af63),
-            axis_z: hex(0x378ef0),
-        };
-        match b {
-            Brightness::Dark => base,
-            // Measured from Illustrator 2026 (plan/illustrator/10-observed-ui.md §1).
-            Brightness::MediumDark => Tokens {
-                app_bar: hex(0x535353),
-                panel: hex(0x535353),
-                panel_darker: hex(0x424242),
-                tab_strip: hex(0x424242),
-                input: hex(0x454545),
-                input_border: hex(0x5f5f5f),
-                border: hex(0x383838),
-                divider: hex(0x4b4b4b),
-                text: hex(0xd1d1d1),
-                text_strong: hex(0xffffff),
-                text_dim: hex(0xb0b0b0),
-                text_disabled: hex(0x7a7a7a),
-                icon: hex(0xc2c2c2),
-                hover: hex(0x606060),
-                tool_active: hex(0x303030),
-                row_selected: hex(0x52677c),
-                pasteboard: hex(0x606060),
-                ruler: hex(0x333333),
-                ruler_tick: hex(0x8a8a8a),
-                button: hex(0x535353),
-                button_border: hex(0x747474),
-                ..base
-            },
-            Brightness::MediumLight => Tokens {
-                tab_strip: hex(0xa6a6a6),
-                text_strong: hex(0x000000),
-                button_border: hex(0x7a7a7a),
-                dark: false,
-                app_bar: hex(0xa9a9a9),
-                panel: hex(0xb8b8b8),
-                panel_darker: hex(0xaaaaaa),
-                input: hex(0xd6d6d6),
-                input_border: hex(0x8c8c8c),
-                border: hex(0x969696),
-                divider: hex(0x9e9e9e),
-                text: hex(0x1f1f1f),
-                text_dim: hex(0x3c3c3c),
-                text_disabled: hex(0x7c7c7c),
-                icon: hex(0x2a2a2a),
-                hover: hex(0xc8c8c8),
-                tool_active: hex(0x969696),
-                row_selected: hex(0x9fb4d6),
-                pasteboard: hex(0xa0a0a0),
-                ruler: hex(0xc2c2c2),
-                ruler_tick: hex(0x4a4a4a),
-                button: hex(0xcacaca),
-                ..base
-            },
-            Brightness::Light => Tokens {
-                tab_strip: hex(0xdddddd),
-                text_strong: hex(0x000000),
-                button_border: hex(0x9a9a9a),
-                dark: false,
-                app_bar: hex(0xe4e4e4),
-                panel: hex(0xf0f0f0),
-                panel_darker: hex(0xe2e2e2),
-                input: hex(0xffffff),
-                input_border: hex(0xb4b4b4),
-                border: hex(0xcfcfcf),
-                divider: hex(0xd6d6d6),
-                text: hex(0x1f1f1f),
-                text_dim: hex(0x4b4b4b),
-                text_disabled: hex(0x9a9a9a),
-                icon: hex(0x303030),
-                hover: hex(0xdddddd),
-                tool_active: hex(0xcdcdcd),
-                row_selected: hex(0xc8daf7),
-                pasteboard: hex(0xdcdcdc),
-                ruler: hex(0xeaeaea),
-                ruler_tick: hex(0x5a5a5a),
-                button: hex(0xe0e0e0),
-                ..base
-            },
+impl Accent {
+    pub const ALL: [Accent; 6] = [Accent::Coral, Accent::Blue, Accent::Violet, Accent::Green, Accent::Amber, Accent::Pink];
+    pub fn id(self) -> &'static str {
+        match self {
+            Accent::Coral => "coral",
+            Accent::Blue => "blue",
+            Accent::Violet => "violet",
+            Accent::Green => "green",
+            Accent::Amber => "amber",
+            Accent::Pink => "pink",
         }
     }
-
-    pub fn get(ctx: &egui::Context) -> Tokens {
-        ctx.data(|d| d.get_temp::<Tokens>(egui::Id::NULL)).unwrap_or_else(|| Tokens::for_brightness(Brightness::MediumDark))
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|a| a.id().eq_ignore_ascii_case(s))
     }
-    pub fn cr(&self) -> CornerRadius {
-        CornerRadius::same(self.radius)
+    /// The accent's seed colour (`0xRRGGBB`) on dark panels and on light ones.
+    fn seed_hex(self, dark: bool) -> u32 {
+        match (self, dark) {
+            (Accent::Coral, true) => 0xf06a52,
+            (Accent::Coral, false) => 0xd9472f,
+            (Accent::Blue, true) => 0x5b96ff,
+            (Accent::Blue, false) => 0x2563eb,
+            (Accent::Violet, true) => 0xa98bff,
+            (Accent::Violet, false) => 0x7146dc,
+            (Accent::Green, true) => 0x3fcf8e,
+            (Accent::Green, false) => 0x16955a,
+            (Accent::Amber, true) => 0xf5b544,
+            (Accent::Amber, false) => 0xb06d06,
+            (Accent::Pink, true) => 0xf36aa3,
+            (Accent::Pink, false) => 0xcc3672,
+        }
     }
 }
 
-/// Selected text in the text fields `ui` draws from here on is in the strong text colour. egui
-/// paints it in the selection stroke's colour, the accent, which is hard to read on the selection's
-/// accent tint (#1465). For fields that draw their own frame: egui's frame takes its focus ring from
-/// the same stroke.
-pub fn strong_selected_text(ui: &mut egui::Ui) {
-    ui.visuals_mut().selection.stroke.color = Tokens::get(ui.ctx()).text_strong;
+/// User Interface › Color Scheme: Modern (the default: slate greys and the chosen accent) or
+/// Classic (the neutral greys and blue accent of earlier versions). Both keep the same layout,
+/// cards and corners; only the colours differ.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Scheme {
+    #[default]
+    Modern,
+    Classic,
 }
 
-pub const FONT_UI: &str = "ui";
-pub const FONT_UI_SEMIBOLD: &str = "ui-semibold";
-pub const FONT_MONO: &str = "mono";
+impl Scheme {
+    pub const ALL: [Scheme; 2] = [Scheme::Modern, Scheme::Classic];
+    pub fn id(self) -> &'static str {
+        match self {
+            Scheme::Modern => "modern",
+            Scheme::Classic => "classic",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.id().eq_ignore_ascii_case(s))
+    }
+}
+
+/// A built-in theme's id; the ids are constants, so the fallback never shows.
+fn theme_id(id: &str) -> ThemeId {
+    ThemeId::parse(id).unwrap_or_else(|_| ThemeId::suite_default())
+}
+
+/// The root theme the saved interface preferences select: its id, its fixed mode (the four
+/// brightness levels decide light or dark, never the system) and the accent seed. Classic keeps its
+/// own blue and Modern's coral is in its theme files, so both return no seed there.
+pub fn root_theme(prefs: &Prefs) -> (ThemeId, ModeChoice, Option<Rgba>) {
+    let brightness = Brightness::parse(&prefs.ui_brightness).unwrap_or_default();
+    let accent = Accent::parse(&prefs.ui_accent).unwrap_or_default();
+    let scheme = Scheme::parse(&prefs.ui_color_scheme).unwrap_or_default();
+    let dark = matches!(brightness, Brightness::Dark | Brightness::MediumDark);
+    let mode = if dark { ModeChoice::Dark } else { ModeChoice::Light };
+    match scheme {
+        Scheme::Classic => {
+            let id = match brightness {
+                Brightness::MediumDark => "craft.artcraft",
+                Brightness::MediumLight => "craft.pro-light-gray",
+                Brightness::Dark | Brightness::Light => "craft.pro",
+            };
+            (theme_id(id), mode, None)
+        }
+        Scheme::Modern => {
+            let id = match brightness {
+                Brightness::Dark | Brightness::Light => "craft.vectorcraft-modern",
+                Brightness::MediumDark | Brightness::MediumLight => "craft.vectorcraft-modern-medium",
+            };
+            let seed = (accent != Accent::Coral).then(|| {
+                let h = accent.seed_hex(dark);
+                Rgba::rgb((h >> 16) as u8, (h >> 8) as u8, h as u8)
+            });
+            (theme_id(id), mode, seed)
+        }
+    }
+}
+
+/// The app's sizes over the framework's size sets (`sizes.json`): push buttons have the app's 4-point corners
+/// where the sets give pills, the Home title is 26-point under 60 points of page margin with a 36-point call to
+/// action, Home keeps production's rhythm (its item spacing of 5 plus the room it added: 9 from title to subtitle, 27
+/// to New and Open, 28-point New and Open with 16 points beside their labels and 14 between them, 33 between sections,
+/// 15 under a heading, 24-point link rows 5 apart), and the compact set takes the reference app's metrics:
+/// 26-point fields and spinners, 24-point push buttons, 10 points inside panels, 5 between rows, 16-point glyphs in
+/// icon buttons, 5-point control corners, 8-point menus and 10-point windows, 33-point panel tabs, 310-point dock
+/// columns with 14-point column bars and 38-point icon columns, 29-point menu rows, and dialogs 22 points inside their
+/// edge with 28-point buttons at least 72 points wide.
+/// Its type is the size the reference app draws: it set Inter at 92% of its nominal 13-point body, 12.5-point labels
+/// and 11.5-point captions, so they read at 12, 11.5 and 10.5 points, on the rows those nominal sizes gave.
+const SIZES: &[u8] = br#"{
+    "all": {
+        "radius.button": 4,
+        "typography.display.size": 26,
+        "typography.display.line_height": 32,
+        "size.page.margin": 60,
+        "size.page.action": 36,
+        "size.page.button": 28,
+        "size.page.button_side": 16,
+        "size.page.gap.title": 9,
+        "size.page.gap.lead": 27,
+        "size.page.gap.actions": 14,
+        "size.page.gap.section": 33,
+        "size.page.gap.heading": 15,
+        "size.page.gap.link": 5,
+        "size.page.link": 24
+    },
+    "compact": {
+        "size.control.md": 26,
+        "size.button": 24,
+        "size.icon.glyph_md": 16,
+        "size.rail.width": 38,
+        "size.dock.column": 310,
+        "size.bar.column": 14,
+        "size.panel_header": 33,
+        "size.bar.tab": 35,
+        "size.bar.tab_large": 44,
+        "space.pad.regular": 10,
+        "space.gap.row": 5,
+        "radius.control": 5,
+        "radius.surface": 8,
+        "radius.window": 10,
+        "size.dialog.button": 72,
+        "size.dialog.button_height": 28,
+        "size.row.menu": 29,
+        "space.pad.dialog": 22,
+        "typography.body.size": 12,
+        "typography.body.line_height": 17,
+        "typography.body_strong.size": 12,
+        "typography.body_strong.line_height": 17,
+        "typography.label.size": 11.5,
+        "typography.label.line_height": 17,
+        "typography.caption.size": 10.5,
+        "typography.caption.line_height": 15
+    }
+}"#;
+
+/// The app's sizes ([`SIZES`]) as one shared value: the token cache tells a change of sizes by its pointer, so a
+/// new value each frame would resolve the tokens again each frame.
+pub fn app_sizes() -> Arc<AppSizes> {
+    static SHARED: LazyLock<Arc<AppSizes>> = LazyLock::new(|| Arc::new(AppSizes::parse_or_default(SIZES)));
+    Arc::clone(&SHARED)
+}
 
 pub fn semibold(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Name(FONT_UI_SEMIBOLD.into()))
+    FontId::new(size, FontFamily::Name(craft::ui::fonts::SEMIBOLD.into()))
 }
 pub fn mono(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Name(FONT_MONO.into()))
-}
-
-pub fn install_fonts(ctx: &egui::Context) {
-    let mut fonts = FontDefinitions::default();
-    let add = |f: &mut FontDefinitions, name: &str, bytes: &'static [u8]| {
-        f.font_data.insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
-    };
-    add(&mut fonts, "SourceSans3", include_bytes!("../../../assets/fonts/SourceSans3-Regular.ttf"));
-    add(&mut fonts, "SourceSans3-Semibold", include_bytes!("../../../assets/fonts/SourceSans3-Semibold.ttf"));
-    add(&mut fonts, "JetBrainsMono", include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf"));
-    let fallback: Vec<String> = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
-    let mut prop = vec!["SourceSans3".to_string()];
-    prop.extend(fallback.clone());
-    fonts.families.insert(FontFamily::Proportional, prop);
-    let mut semi = vec!["SourceSans3-Semibold".to_string()];
-    semi.extend(fallback.clone());
-    fonts.families.insert(FontFamily::Name(FONT_UI_SEMIBOLD.into()), semi);
-    let mut ui = vec!["SourceSans3".to_string()];
-    ui.extend(fallback.clone());
-    fonts.families.insert(FontFamily::Name(FONT_UI.into()), ui);
-    let mut mono = vec!["JetBrainsMono".to_string()];
-    mono.extend(fallback);
-    fonts.families.insert(FontFamily::Name(FONT_MONO.into()), mono);
-    add_craft_fonts(&mut fonts);
-    ctx.set_fonts(fonts);
-}
-
-/// The egui name of a craft-fonts face.
-pub(crate) fn craft_font_name(f: &vectorcraft_text::CraftFont) -> String {
-    format!("craft-fonts {} {}", f.family, f.style)
-}
-
-/// The Japanese craft-fonts faces (when built with `CRAFT_FONTS_DIR`) as fallbacks at the end of
-/// every family, after the app's own fonts and before the installed fonts `ui_fonts` adds: BIZ
-/// UDPGothic first (bold first in the semibold family), then the Mincho faces.
-fn add_craft_fonts(fonts: &mut FontDefinitions) {
-    for f in vectorcraft_text::CRAFT_FONTS.iter().filter(|f| f.is_japanese()) {
-        fonts.font_data.insert(craft_font_name(f), Arc::new(FontData::from_static(f.bytes)));
-    }
-    for (family, stack) in fonts.families.iter_mut() {
-        let bold = *family == FontFamily::Name(FONT_UI_SEMIBOLD.into());
-        stack.extend(vectorcraft_text::craft_fonts::japanese_ui_fonts(bold).into_iter().map(craft_font_name));
-    }
-}
-
-/// Apply tokens to egui's global style.
-pub fn apply(ctx: &egui::Context, b: Brightness) {
-    let t = Tokens::for_brightness(b);
-    ctx.data_mut(|d| d.insert_temp(egui::Id::NULL, t));
-    let mut v = if t.dark { Visuals::dark() } else { Visuals::light() };
-    v.panel_fill = t.panel;
-    v.window_fill = t.panel;
-    v.extreme_bg_color = t.input;
-    v.faint_bg_color = t.panel_darker;
-    v.window_stroke = Stroke::new(1.0, t.border);
-    v.window_corner_radius = CornerRadius::same(6);
-    v.menu_corner_radius = CornerRadius::same(6);
-    v.selection.bg_fill = t.accent.gamma_multiply(0.55);
-    v.selection.stroke = Stroke::new(1.0, t.accent);
-    v.hyperlink_color = t.accent;
-    v.override_text_color = Some(t.text);
-    v.popup_shadow = egui::epaint::Shadow { offset: [0, 4], blur: 14, spread: 0, color: Color32::from_black_alpha(if t.dark { 120 } else { 60 }) };
-    v.window_shadow = egui::epaint::Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(if t.dark { 140 } else { 70 }) };
-    let w = &mut v.widgets;
-    craft_ui::theme::WidgetPalette { noninteractive: t.panel, inactive: t.button, hovered: t.hover, active: t.tool_active, open: t.hover }.apply_to(
-        w,
-        t.cr(),
-        Stroke::new(1.0, t.text),
-    );
-    w.noninteractive.bg_stroke = Stroke::new(1.0, t.divider);
-    w.inactive.bg_stroke = Stroke::NONE;
-    w.hovered.bg_stroke = Stroke::new(1.0, t.input_border);
-    w.active.bg_stroke = Stroke::new(1.0, t.accent);
-    ctx.set_visuals(v);
-    ctx.global_style_mut(|s| {
-        s.spacing.item_spacing = egui::vec2(6.0, 5.0);
-        s.spacing.button_padding = egui::vec2(6.0, 2.0);
-        s.spacing.interact_size = egui::vec2(24.0, 24.0);
-        s.spacing.menu_margin = egui::Margin::same(6);
-        s.spacing.slider_width = 120.0;
-        s.text_styles = [
-            (TextStyle::Small, FontId::proportional(11.0)),
-            (TextStyle::Body, FontId::proportional(13.0)),
-            (TextStyle::Button, FontId::proportional(13.0)),
-            (TextStyle::Heading, FontId::new(15.0, FontFamily::Name(FONT_UI_SEMIBOLD.into()))),
-            (TextStyle::Monospace, FontId::new(11.5, FontFamily::Name(FONT_MONO.into()))),
-        ]
-        .into();
-        s.animation_time = 0.08;
-    });
+    FontId::monospace(size)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The saved strings are what Preferences and old settings files hold.
     #[test]
     fn brightness_roundtrip() {
         for b in Brightness::ALL {
             assert_eq!(Brightness::parse(b.id()), Some(b));
             assert_eq!(Brightness::parse(b.label()), Some(b));
         }
-        assert!(!Tokens::for_brightness(Brightness::Light).dark);
+    }
+
+    /// A size `app_sizes` cannot read is only logged and dropped, which brings the pill buttons back unnoticed.
+    #[test]
+    fn the_app_sizes_are_read_whole() {
+        assert!(AppSizes::parse(SIZES).is_ok_and(|sizes| !sizes.is_empty()));
     }
 }
