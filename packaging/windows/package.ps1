@@ -5,7 +5,7 @@
 .DESCRIPTION
   Produces, in $env:DIST (default: dist/release):
     vectorcraft-<version>-windows-<arch>.msi            per-machine installer (WiX v5)
-    vectorcraft-<version>-windows-<arch>-portable.zip   vectorcraft.exe + vectorcraft-cli.exe
+    vectorcraft-<version>-windows-<arch>-portable.zip   vectorcraft.exe + vectorcraft-cli.exe + portable.txt
 
   The binaries link the C runtime statically (+crt-static), so neither the MSI nor the portable
   zip needs the Visual C++ redistributable. Signing is delegated to sign.ps1 (skipped with a
@@ -22,9 +22,12 @@
 #>
 param(
   [ValidateSet('x64', 'x86', 'arm64')] [string] $Arch = 'x64',
-  [switch] $SkipBuild
+  [switch] $SkipBuild,
+  [switch] $Nightly,
+  [switch] $BuildOnly
 )
 $ErrorActionPreference = 'Stop'
+if ($BuildOnly -and -not $Nightly) { throw '-BuildOnly is only for secret-free nightly compilation' }
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 
 function Invoke-Native([string] $What, [scriptblock] $Block) {
@@ -51,12 +54,22 @@ $Dist = if ($env:DIST) { $env:DIST } else { Join-Path $Root 'dist\release' }
 $TargetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $Root 'target' }
 New-Item -ItemType Directory -Force -Path $Dist | Out-Null
 
-if (-not $env:VECTORCRAFT_BUILD_SHA) { $env:VECTORCRAFT_BUILD_SHA = (git -C $Root rev-parse HEAD 2>$null) }
-if (-not $env:VECTORCRAFT_BUILD_DATE) { $env:VECTORCRAFT_BUILD_DATE = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd') }
+# A nightly requires the prepared commit and the original run date explicitly; nightly.ps1 checks both.
+if (-not $Nightly) {
+  if (-not $env:VECTORCRAFT_BUILD_SHA) { $env:VECTORCRAFT_BUILD_SHA = (git -C $Root rev-parse HEAD 2>$null) }
+  if (-not $env:VECTORCRAFT_BUILD_DATE) { $env:VECTORCRAFT_BUILD_DATE = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd') }
+}
 
 Write-Output "VectorCraft $Version for Windows $Arch ($Target)"
 
+if ($Nightly) {
+  & (Join-Path $PSScriptRoot 'nightly.ps1') -Arch $Arch -Version $Version -Target $Target -TargetDir $TargetDir -Dist $Dist -SkipBuild:$SkipBuild -BuildOnly:$BuildOnly
+  return
+}
+
 if (-not $SkipBuild) {
+  # A stable package is built from the stable channel, whatever the caller's environment says.
+  $env:VECTORCRAFT_BUILD_CHANNEL = 'stable'
   # Static CRT: no VC++ redistributable needed. Scoped to the target so host build scripts and
   # proc-macros are unaffected.
   $flagVar = 'CARGO_TARGET_' + ($Target.ToUpper() -replace '-', '_') + '_RUSTFLAGS'
@@ -67,6 +80,18 @@ if (-not $SkipBuild) {
 }
 
 $Bin = Join-Path $TargetDir "$Target\release"
+
+# A nightly executable can never be packaged as the stable app: its identity, its updates and its
+# data folder are the nightly ones, and the MSI would install it over the stable installation.
+$productName = (Get-Item -LiteralPath (Join-Path $Bin 'vectorcraft.exe')).VersionInfo.ProductName
+if ($productName -eq 'VectorCraft Nightly') {
+  throw 'a VectorCraft Nightly executable cannot be packaged as stable (use package.ps1 -Nightly)'
+}
+# No VERSIONINFO at all reads as an empty name, and an executable built without the resource
+# compiler (or taken from another source with -SkipBuild) must not reach the stable MSI that way.
+if ($productName -cne 'VectorCraft') {
+  throw "the executable has no stable VERSIONINFO (ProductName '$productName'); rebuild with the resource compiler available"
+}
 
 # Check both binaries' PE headers before packaging. Machine (COFF header) must match -Arch, so an
 # x64 build can never ship labelled arm64. Subsystem (optional header): 2 = Windows GUI, 3 = console.
@@ -90,6 +115,23 @@ New-Item -ItemType Directory -Force -Path $Stage | Out-Null
 Copy-Item (Join-Path $Bin 'vectorcraft.exe'), (Join-Path $Bin 'vectorcraft-cli.exe') $Stage
 
 & (Join-Path $PSScriptRoot 'sign.ps1') (Join-Path $Stage 'vectorcraft.exe') (Join-Path $Stage 'vectorcraft-cli.exe')
+
+# Documentation and dependency licences shared by the MSI and portable ZIP.
+$Docs = Join-Path $Stage 'docs'
+New-Item -ItemType Directory -Force -Path $Docs | Out-Null
+foreach ($f in 'README.md', 'LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE', 'NOTICE', 'ASSETS.md') {
+  $p = Join-Path $Root $f
+  if (Test-Path $p) { Copy-Item $p $Docs }
+}
+# Built with craft-fonts (CRAFT_FONTS_DIR, release builds): the embedded fonts' licences.
+if ($env:CRAFT_FONTS_DIR) {
+  foreach ($ofl in Get-ChildItem -Path (Join-Path $env:CRAFT_FONTS_DIR 'fonts\*\OFL.txt') -ErrorAction SilentlyContinue) {
+    Copy-Item $ofl.FullName (Join-Path $Docs "OFL-$($ofl.Directory.Name).txt")
+  }
+}
+if (Test-Path (Join-Path $Root 'licenses')) {
+  Copy-Item -Recurse (Join-Path $Root 'licenses') $Docs
+}
 
 # ---- MSI ---------------------------------------------------------------------------------------
 # The setup wizard's art, drawn here from the app icon so the MSI shows VectorCraft rather than
@@ -135,9 +177,11 @@ Invoke-Native 'wix build' {
     -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext `
     -culture en-US -loc (Join-Path $PSScriptRoot 'vectorcraft.en-us.wxl') `
     -d "Version=$MsiVersion" -d "DisplayVersion=$Version" -d "BinDir=$Stage" -d "IconPath=$(Join-Path $Root 'assets\app-icon\vectorcraft.ico')" `
-    -d "BannerBmp=$Banner" -d "DialogBmp=$Dialog" `
+    -d "DocsDir=$Docs" -d "BannerBmp=$Banner" -d "DialogBmp=$Dialog" `
     -o $Msi
 }
+# Check the compiled scope, path and registration contract before signing.
+& (Join-Path $PSScriptRoot 'check-install-policy.ps1') -MsiPath $Msi
 # wix writes its debug symbols (.wixpdb) next to the MSI; keep them out of the release assets.
 Remove-Item -Force -ErrorAction SilentlyContinue ([IO.Path]::ChangeExtension($Msi, '.wixpdb'))
 & (Join-Path $PSScriptRoot 'sign.ps1') $Msi
@@ -147,16 +191,10 @@ $Portable = Join-Path $TargetDir "windows-package\vectorcraft-$Version-windows-$
 Remove-Item -Recurse -Force $Portable -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $Portable | Out-Null
 Copy-Item (Join-Path $Stage '*.exe') $Portable
-foreach ($f in 'README.md', 'LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE') {
-  $p = Join-Path $Root $f
-  if (Test-Path $p) { Copy-Item $p $Portable }
-}
-# Built with craft-fonts (CRAFT_FONTS_DIR, release builds): the embedded fonts' licences.
-if ($env:CRAFT_FONTS_DIR) {
-  foreach ($ofl in Get-ChildItem -Path (Join-Path $env:CRAFT_FONTS_DIR 'fonts\*\OFL.txt') -ErrorAction SilentlyContinue) {
-    Copy-Item $ofl.FullName (Join-Path $Portable "OFL-$($ofl.Directory.Name).txt")
-  }
-}
+Copy-Item -Recurse (Join-Path $Docs '*') $Portable
+# portable.txt beside vectorcraft.exe switches on portable mode: settings, libraries, recovery
+# files and logs go to VectorCraftData\ next to the exe instead of %APPDATA% (#1366; see profile.rs).
+Copy-Item (Join-Path $PSScriptRoot 'portable.txt') $Portable
 $Zip = Join-Path $Dist "vectorcraft-$Version-windows-$Arch-portable.zip"
 Remove-Item -Force $Zip -ErrorAction SilentlyContinue
 Compress-Archive -Path $Portable -DestinationPath $Zip
